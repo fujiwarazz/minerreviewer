@@ -1,0 +1,53 @@
+venue_id: "ICLR"
+retrieval:
+  top_k_papers: 4
+  top_k_reviews: 12
+  unrelated_k: 10
+  similarity_threshold: 0.35
+vector_store:
+  backend: "milvus"
+  host: "10.20.49.150"
+  port: 19530
+  papers_collection: "papers_iclr"
+  reviews_collection: "reviews_iclr"
+  coverage_gaps_collection: "coverage_gaps_iclr"
+embedding:
+  backend: "vllm"
+  model: "bge-embedding"
+  vllm_base_url: "http://10.20.49.150:8001/v1"
+distill:
+  max_total: 12
+  max_per_theme: 4
+  dedup_threshold: 0.86
+  seed: 42
+  strategy: "max_volume"
+  epsilon: 1.0
+policy_mining:
+  sample_accept: 3
+  sample_reject: 3
+decision_scoring:
+  use_similarity: true
+  top_k: 8
+review:
+  use_fulltext: true
+  max_fulltext_chars: 12000
+themes: []
+calibration:
+  method: "isotonic"
+  min_history: 100
+llm:
+  backend: "dashscope"
+  model: "qwen-plus"
+  temperature: 0.1
+memory:
+  store_path: "data/processed/memory_store.json"
+  similarity_threshold: 0.7
+  stable_margin: 0.5
+  borderline_low: 0.45
+  borderline_high: 0.6
+coverage_eval:
+  enabled: true
+  method: "llm"
+  threshold: 0.55
+  max_points: 12
+  store_gaps: true
