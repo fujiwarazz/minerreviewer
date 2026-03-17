@@ -10,15 +10,31 @@ from agents.base import AgentConfig
 from agents.theme_agent import ThemeAgent
 from clients.embedding_client import EmbeddingClient, EmbeddingConfig
 from clients.llm_client import LLMClient, LLMConfig
-from common.types import ArbiterOutput, Criterion, Paper, ThemeOutput
+from common.types import (
+    ActivatedCriterion,
+    ArbiterOutput,
+    CalibrationResult,
+    Criterion,
+    DecisionVerificationReport,
+    Paper,
+    PaperSignature,
+    ScoreConsistencyReport,
+    ThemeOutput,
+)
 from common.utils import read_yaml
 from pipeline.aggregate import Aggregator
 from pipeline.calibrate import Calibrator
+from pipeline.check_score_consistency import ScoreConsistencyChecker
 from pipeline.distill_criteria import CriteriaDistiller
+from pipeline.distill_experience import DistillationResult, ExperienceDistiller
+from pipeline.memory_editor import MemoryEditor
 from pipeline.mine_criteria import CriteriaMiner
+from pipeline.parse_paper import PaperParser
+from pipeline.plan_criteria import CriteriaPlanner
 from pipeline.retrieve import Retriever
 from pipeline.rewrite_criteria import CriteriaRewriter
-from pipeline.update_memory import update_memory
+from pipeline.verify_decision import DecisionVerifier
+from storage.case_store import CaseStore
 from storage.doc_store import DocStore
 from storage.memory_store import MemoryStore
 
@@ -26,12 +42,44 @@ logger = logging.getLogger(__name__)
 
 
 class ReviewPipeline:
+    """Memory-driven reviewer pipeline"""
+
     def __init__(self, config_path: str | Path) -> None:
         self.config = read_yaml(config_path)
         self.venue_id = self.config["venue_id"]
         self.doc_store = DocStore()
         self.llm = LLMClient(LLMConfig(**self.config["llm"]))
         self.embedding_client = EmbeddingClient(EmbeddingConfig(**self.config["embedding"]))
+
+        # Initialize new components
+        self._init_stores()
+        self._init_components()
+
+    def _init_stores(self) -> None:
+        """初始化存储组件"""
+        memory_cfg = self.config.get("memory", {})
+        self.memory_store = MemoryStore(memory_cfg.get("store_path", "data/processed/memory_store.json"))
+        self.case_store = CaseStore(
+            memory_cfg.get("case_store_path", "data/processed/cases.jsonl"),
+            embedding_client=self.embedding_client,
+        )
+
+    def _init_components(self) -> None:
+        """初始化处理组件"""
+        self.paper_parser = PaperParser(self.llm)
+        self.criteria_planner = CriteriaPlanner(self.llm)
+        self.score_checker = ScoreConsistencyChecker(
+            rating_tolerance=self.config.get("score_consistency", {}).get("rating_tolerance", 1.5),
+            deviation_threshold=self.config.get("score_consistency", {}).get("deviation_threshold", 2.0),
+        )
+        self.verifier = DecisionVerifier(self.llm)
+        self.experience_distiller = ExperienceDistiller(self.llm)
+        self.memory_editor = MemoryEditor(
+            memory_store=self.memory_store,
+            case_store=self.case_store,
+            short_term_utility_threshold=self.config.get("memory", {}).get("short_term_utility_threshold", 0.3),
+            long_term_utility_threshold=self.config.get("memory", {}).get("long_term_utility_threshold", 0.6),
+        )
 
     def review_paper(self, paper_id: str, target_year: int | None = None) -> ArbiterOutput:
         papers = self.doc_store.load_papers(self.venue_id)
@@ -41,30 +89,104 @@ class ReviewPipeline:
         return self._run_review(target, target_year or target.year)
 
     def _run_review(self, target: Paper, target_year: int | None) -> ArbiterOutput:
+        """主审稿流程"""
         retrieval_cfg = self.config["retrieval"]
         distill_cfg = self.config["distill"]
         memory_cfg = self.config["memory"]
 
+        # 1. Parse paper signature
+        signature = self._parse_paper(target)
+
+        # 2. Multi-channel retrieval
+        bundle = self._retrieve_multi_channel(target, signature, target_year)
+
+        # 3. Mine and distill criteria
+        content_criteria, policy_criteria = self._mine_criteria(target, bundle, target_year)
+
+        # 4. Plan criteria with memory
+        activated = self._plan_criteria(signature, bundle, content_criteria)
+
+        # 5. Rewrite criteria
+        criteria = self._rewrite_criteria(target, activated)
+
+        # 6. Run theme agents
+        theme_outputs = self._run_theme_agents(target, criteria)
+
+        # 7. Aggregate with arbiter
+        arbiter_output = self._aggregate(theme_outputs, bundle.policy_cards)
+
+        # 8. Verify decision
+        verification = self._verify_decision(arbiter_output, target, bundle)
+
+        # 9. Check score consistency (只警告，不改分)
+        consistency = self._check_score_consistency(arbiter_output, bundle)
+
+        # 10. Calibrate (多路校准)
+        calibration = self._calibrate_multiclass(arbiter_output.raw_rating, target_year)
+
+        # 11. Distill experience
+        experience = self._distill_experience(arbiter_output, target, signature, bundle)
+
+        # 12. Update memory
+        memory_updates = self._update_memory(experience)
+
+        # 13. Build trace
+        arbiter_output.raw_decision = arbiter_output.decision_recommendation
+        arbiter_output.trace.update({
+            "paper_signature": signature.model_dump() if signature else {},
+            "retrieval": bundle.trace,
+            "verification": verification.model_dump(),
+            "consistency": consistency.model_dump(),
+            "calibration": calibration.model_dump(),
+            "memory_updates": memory_updates,
+            "activated_criteria": [c.model_dump() for c in activated[:10]],
+        })
+
+        return arbiter_output
+
+    def _parse_paper(self, paper: Paper) -> PaperSignature:
+        """解析论文结构化特征"""
+        try:
+            return self.paper_parser.parse(paper)
+        except Exception as e:
+            logger.warning("Failed to parse paper: %s", e)
+            return PaperSignature()
+
+    def _retrieve_multi_channel(self, target: Paper, signature: PaperSignature | None, target_year: int | None):
+        """多通道检索"""
+        retrieval_cfg = self.config["retrieval"]
         retriever = Retriever(
             self.venue_id,
             EmbeddingConfig(**self.config["embedding"]),
             self.config.get("vector_store"),
+            case_store=self.case_store,
+            memory_store=self.memory_store,
         )
+        use_case_memory = self.config.get("retrieval", {}).get("use_case_memory", True)
         bundle = retriever.retrieve(
             target,
             retrieval_cfg["top_k_papers"],
             retrieval_cfg["top_k_reviews"],
-            retrieval_cfg["unrelated_k"],
+            retrieval_cfg.get("unrelated_k", 0),
             retrieval_cfg["similarity_threshold"],
             target_year,
+            paper_signature=signature,
+            use_case_memory=use_case_memory,
         )
         logger.info(
-            "Retrieved %s related papers, %s related reviews, %s unrelated papers",
+            "Multi-channel retrieval: %d papers, %d reviews, %d cases, %d policy cards",
             len(bundle.related_papers),
             len(bundle.related_reviews),
-            len(bundle.unrelated_papers),
+            len(bundle.similar_paper_cases),
+            len(bundle.policy_cards),
         )
+        return bundle
 
+    def _mine_criteria(self, target: Paper, bundle, target_year: int | None):
+        """挖掘和精炼标准"""
+        distill_cfg = self.config["distill"]
+
+        # Sample reviews for policy mining
         reviews_pool = [review for review in self.doc_store.load_reviews(self.venue_id) if review.paper_id != target.paper_id]
         if target_year is not None:
             reviews_pool = [review for review in reviews_pool if review.year is None or review.year < target_year]
@@ -76,13 +198,12 @@ class ReviewPipeline:
         sampled_accept = random.sample(accept_reviews, min(accept_count, len(accept_reviews)))
         sampled_reject = random.sample(reject_reviews, min(reject_count, len(reject_reviews)))
         random_reviews = sampled_accept + sampled_reject
-        logger.info("Sampled %s accept/%s reject reviews for policy mining", len(sampled_accept), len(sampled_reject))
 
         miner = CriteriaMiner(self.llm, self.embedding_client, self.config.get("vector_store"))
         content_criteria = miner.mine_content_criteria(target, bundle.related_papers, bundle.related_reviews)
         policy_criteria = miner.mine_policy_criteria(bundle.venue_policy, random_reviews)
-        logger.info("Criteria mined: content=%s policy=%s", len(content_criteria), len(policy_criteria))
 
+        # Distill criteria
         distiller = CriteriaDistiller(
             self.config["embedding"]["model"],
             embedder=lambda texts, _: self.embedding_client.embed(texts),
@@ -96,7 +217,6 @@ class ReviewPipeline:
             distill_cfg.get("strategy"),
             distill_cfg.get("epsilon", 1.0),
         )
-
         policy_criteria = distiller.dedup(policy_criteria, distill_cfg["dedup_threshold"])
         policy_criteria = distiller.select(
             policy_criteria,
@@ -106,77 +226,127 @@ class ReviewPipeline:
             distill_cfg.get("strategy"),
             distill_cfg.get("epsilon", 1.0),
         )
-        logger.info("Criteria selected: content=%s policy=%s", len(content_criteria), len(policy_criteria))
 
+        logger.info("Criteria: content=%d policy=%d", len(content_criteria), len(policy_criteria))
+        return content_criteria, policy_criteria
+
+    def _plan_criteria(
+        self,
+        signature: PaperSignature | None,
+        bundle,
+        content_criteria: list[Criterion],
+    ) -> list[ActivatedCriterion]:
+        """规划激活的标准"""
+        max_criteria = self.config.get("distill", {}).get("max_total", 15)
+        return self.criteria_planner.plan(
+            signature=signature,
+            bundle=bundle,
+            mined_criteria=content_criteria,
+            max_criteria=max_criteria,
+        )
+
+    def _rewrite_criteria(self, target: Paper, activated: list[ActivatedCriterion]) -> list[Criterion]:
+        """重写标准"""
+        criteria = self.criteria_planner.to_criterion_list(activated)
         rewriter = CriteriaRewriter(self.llm)
-        content_criteria = rewriter.rewrite(target, content_criteria)
-        logger.info("Criteria rewritten: content=%s", len(content_criteria))
+        return rewriter.rewrite(target, criteria)
 
-        theme_outputs = self._run_theme_agents(target, content_criteria)
-        logger.info("Theme agent outputs: %s", len(theme_outputs))
+    def _aggregate(self, theme_outputs: list[ThemeOutput], policy_cards) -> ArbiterOutput:
+        """聚合主题输出"""
         arbiter = ArbiterAgent(AgentConfig(name="arbiter", llm=self.llm))
         aggregator = Aggregator(arbiter)
-        arbiter_output = aggregator.aggregate(theme_outputs, policy_criteria, bundle.venue_policy)
+        # Convert policy cards to criteria for compatibility
+        policy_criteria = []
+        return aggregator.aggregate(theme_outputs, policy_criteria, None)
 
-        decision_cfg = self.config.get("decision_scoring", {})
-        if decision_cfg.get("use_similarity", True):
-            arbiter_output = self._score_with_similar_reviews(
-                target,
-                arbiter_output,
-                decision_cfg,
-                target_year,
+    def _verify_decision(
+        self,
+        arbiter_output: ArbiterOutput,
+        paper: Paper,
+        bundle,
+    ) -> DecisionVerificationReport:
+        """验证决策"""
+        return self.verifier.verify(arbiter_output, paper, bundle)
+
+    def _check_score_consistency(
+        self,
+        arbiter_output: ArbiterOutput,
+        bundle,
+    ) -> ScoreConsistencyReport:
+        """检查评分一致性"""
+        return self.score_checker.check(arbiter_output, bundle)
+
+    def _calibrate_multiclass(self, raw_rating: float, target_year: int | None) -> CalibrationResult:
+        """多路校准"""
+        calibration_cfg = self.config.get("calibration", {})
+        mode = calibration_cfg.get("mode", "ordinal")
+
+        if calibration_cfg.get("method") in (None, "none"):
+            return CalibrationResult(
+                calibrated_rating=raw_rating,
+                acceptance_likelihood=0.5,
+                method="none",
             )
-        arbiter_output.raw_decision = arbiter_output.decision_recommendation
 
-        acceptance = None
-        if self.config.get("calibration", {}).get("method") not in (None, "none"):
-            calibrator = Calibrator(self.venue_id)
-            try:
-                acceptance = calibrator.predict(arbiter_output.raw_rating)
-            except Exception:  # noqa: BLE001
-                reviews = self.doc_store.load_reviews(self.venue_id)
-                if target_year is not None:
-                    reviews = [review for review in reviews if review.year is None or review.year < target_year]
-                artifact = calibrator.fit(reviews)
-                if artifact is not None:
-                    acceptance = calibrator.predict(arbiter_output.raw_rating)
-                else:
-                    logger.info("Calibrator not available; skipping")
-        if acceptance is not None:
-            arbiter_output.acceptance_likelihood = acceptance
-            arbiter_output.calibrated_rating = acceptance
+        calibrator = Calibrator(self.venue_id, mode=mode)
+        try:
+            return calibrator.calibrate(raw_rating)
+        except FileNotFoundError:
+            # Fit calibrator
+            reviews = self.doc_store.load_reviews(self.venue_id)
+            if target_year is not None:
+                reviews = [r for r in reviews if r.year is None or r.year < target_year]
+            calibrator.fit(reviews)
+            return calibrator.calibrate(raw_rating)
+        except Exception as e:
+            logger.warning("Calibration failed: %s", e)
+            return CalibrationResult(
+                calibrated_rating=raw_rating,
+                acceptance_likelihood=0.5,
+                method="none",
+            )
 
-        store = MemoryStore(memory_cfg["store_path"])
-        updated_cards = update_memory(
-            store,
-            self.venue_id,
-            policy_criteria,
-            arbiter_output.raw_rating,
-            arbiter_output.acceptance_likelihood or arbiter_output.raw_rating,
-            memory_cfg["similarity_threshold"],
-            memory_cfg["stable_margin"],
-            memory_cfg["borderline_low"],
-            memory_cfg["borderline_high"],
-            trace=bundle.trace,
+    def _distill_experience(
+        self,
+        arbiter_output: ArbiterOutput,
+        paper: Paper,
+        signature: PaperSignature | None,
+        bundle,
+    ) -> DistillationResult:
+        """蒸馏经验"""
+        return self.experience_distiller.distill(
+            arbiter_output=arbiter_output,
+            paper=paper,
+            signature=signature,
+            bundle=bundle,
         )
 
-        arbiter_output.trace.update(
-            {
-                "retrieval": bundle.trace,
-                "criteria": {
-                    "content": [c.criterion_id for c in content_criteria],
-                    "policy": [c.criterion_id for c in policy_criteria],
-                },
-                "criteria_details": {
-                    "content": [c.model_dump() for c in content_criteria],
-                    "policy": [c.model_dump() for c in policy_criteria],
-                },
-                "decision_scoring": self.config.get("decision_scoring", {}),
-                "memory_updates": updated_cards,
-                "calibration": self.config["calibration"]["method"] if acceptance is not None else "none",
-            }
-        )
-        return arbiter_output
+    def _update_memory(self, experience: DistillationResult) -> dict:
+        """更新记忆"""
+        updates: dict[str, list[str]] = {
+            "paper_cases": [],
+            "policy_cards": [],
+            "critique_cards": [],
+            "failure_cards": [],
+        }
+
+        # Admit paper case
+        if experience.paper_case:
+            if self.memory_editor.admit_paper_case(experience.paper_case):
+                updates["paper_cases"].append(experience.paper_case.case_id)
+
+        # Admit experience cards
+        for card in experience.all_cards():
+            result = self.memory_editor.admit(card)
+            if result == "admitted_long" or result == "admitted_short":
+                if card.kind == "policy":
+                    updates["policy_cards"].append(card.card_id)
+                elif card.kind == "critique":
+                    updates["critique_cards"].append(card.card_id)
+                elif card.kind == "failure":
+                    updates["failure_cards"].append(card.card_id)
+
+        return updates
 
     def _run_theme_agents(self, target: Paper, criteria: list[Criterion]) -> list[ThemeOutput]:
         themes = list(self.config.get("themes", []))
@@ -190,7 +360,7 @@ class ReviewPipeline:
 
         # Parallel execution of theme agents
         outputs: list[ThemeOutput] = []
-        max_workers = min(len(themes), 6)  # Limit concurrent threads
+        max_workers = min(len(themes), 6)
 
         def review_theme(theme: str) -> ThemeOutput:
             themed = [c for c in criteria if c.theme == theme]
@@ -212,78 +382,7 @@ class ReviewPipeline:
                         theme = futures[future]
                         logger.error("Theme agent %s failed: %s", theme, e)
         else:
-            # Fallback to sequential for single theme or safety
             for theme in themes:
                 outputs.append(review_theme(theme))
 
         return outputs
-
-    @staticmethod
-    def _decision_from_acceptance(acceptance: float) -> str:
-        if acceptance >= 0.6:
-            return "accept"
-        if acceptance <= 0.4:
-            return "reject"
-        return "borderline"
-
-    def _score_with_similar_reviews(
-        self,
-        target: Paper,
-        arbiter_output: ArbiterOutput,
-        decision_cfg: dict,
-        target_year: int | None,
-    ) -> ArbiterOutput:
-        top_k = int(decision_cfg.get("top_k", 8))
-        retriever = Retriever(
-            self.venue_id,
-            EmbeddingConfig(**self.config["embedding"]),
-            self.config.get("vector_store"),
-        )
-        pseudo_review = self._format_pseudo_review(arbiter_output.strengths, arbiter_output.weaknesses)
-        similar_reviews = retriever.retrieve_similar_reviews(pseudo_review, top_k, target_year, target.paper_id)
-        if not similar_reviews:
-            return arbiter_output
-        prompt = self._decision_prompt(target, pseudo_review, similar_reviews)
-        response = self.llm.generate_json(prompt)
-        raw_rating = response.get("raw_rating", arbiter_output.raw_rating)
-        decision = response.get("decision_recommendation", arbiter_output.decision_recommendation)
-        arbiter_output.raw_rating = float(raw_rating) if raw_rating is not None else arbiter_output.raw_rating
-        arbiter_output.decision_recommendation = decision
-        arbiter_output.trace["similar_reviews_used"] = [
-            {
-                "review_id": r.review_id,
-                "paper_id": r.paper_id,
-                "rating": r.rating,
-                "decision": r.decision,
-            }
-            for r in similar_reviews
-        ]
-        return arbiter_output
-
-    @staticmethod
-    def _format_pseudo_review(strengths: list[str], weaknesses: list[str]) -> str:
-        parts = ["Strengths:"]
-        parts.extend([f"- {item}" for item in strengths])
-        parts.append("Weaknesses:")
-        parts.extend([f"- {item}" for item in weaknesses])
-        return "\n".join(parts)
-
-    @staticmethod
-    def _decision_prompt(target: Paper, pseudo_review: str, similar_reviews: list[Review]) -> str:
-        examples = [
-            {
-                "review": review.text[:800],
-                "rating": review.rating,
-                "decision": review.decision,
-            }
-            for review in similar_reviews
-        ]
-        return "\n".join(
-            [
-                "You are assigning a rating and decision based on similar historical reviews.",
-                f"Target paper: {target.title}\n{target.abstract}",
-                f"Generated review:\n{pseudo_review}",
-                f"Similar reviews with ratings/decisions: {examples}",
-                "Return JSON with keys raw_rating (float) and decision_recommendation (accept/reject/borderline/revise).",
-            ]
-        )

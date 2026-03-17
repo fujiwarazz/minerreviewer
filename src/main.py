@@ -13,6 +13,7 @@ from clients.embedding_client import EmbeddingClient, EmbeddingConfig
 from common.logging import setup_logging
 from common.types import Paper
 from common.utils import write_json
+from pipeline.build_cases import build_cases_command
 from pipeline.review_pipeline import ReviewPipeline
 from storage.doc_store import DocStore
 from storage.faiss_index import FaissIndex
@@ -144,6 +145,23 @@ def evaluate(config_path: str, target_year: int) -> None:
     print(json.dumps(metrics, indent=2, ensure_ascii=True))
 
 
+def build_cases(
+    config_path: str,
+    venue_id: str | None,
+    target_year: int | None,
+    limit: int | None,
+    skip_existing: bool,
+) -> None:
+    """Build PaperCase from existing papers and reviews"""
+    build_cases_command(
+        config_path=config_path,
+        venue_id=venue_id,
+        target_year=target_year,
+        limit=limit,
+        skip_existing=skip_existing,
+    )
+
+
 def main() -> None:
     setup_logging()
     parser = argparse.ArgumentParser(description="Conference-aware multi-agent peer review system")
@@ -174,6 +192,13 @@ def main() -> None:
     eval_parser.add_argument("--config", default="configs/iclr.yaml")
     eval_parser.add_argument("--target_year", type=int, required=True)
 
+    build_cases_parser = subparsers.add_parser("build_cases", help="Build PaperCase from papers and reviews")
+    build_cases_parser.add_argument("--config", default="configs/iclr.yaml")
+    build_cases_parser.add_argument("--venue_id", default=None)
+    build_cases_parser.add_argument("--target_year", type=int, default=None)
+    build_cases_parser.add_argument("--limit", type=int, default=None)
+    build_cases_parser.add_argument("--skip_existing", action="store_true", default=True)
+
     args = parser.parse_args()
     if args.command == "build_index":
         build_index(
@@ -194,6 +219,8 @@ def main() -> None:
         review_paper(args.config, args.paper_id, args.target_year, args.parquet_path, args.parquet_row)
     elif args.command == "evaluate":
         evaluate(args.config, args.target_year)
+    elif args.command == "build_cases":
+        build_cases(args.config, args.venue_id, args.target_year, args.limit, args.skip_existing)
     else:
         raise ValueError("Unknown command")
 

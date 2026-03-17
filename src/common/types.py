@@ -16,6 +16,41 @@ class Paper(BaseModel):
     fulltext: str | None = None
 
 
+class PaperSignature(BaseModel):
+    """论文结构化特征，用于论文分类和相似性匹配"""
+    paper_type: str | None = None  # empirical/theoretical/survey/system/analysis
+    tasks: list[str] = Field(default_factory=list)  # [classification, generation, detection...]
+    domain: str | None = None  # vision/nlp/audio/multimodal/reinforcement_learning
+    method_family: list[str] = Field(default_factory=list)  # [transformer, gan, diffusion, gnn...]
+    main_claims: list[str] = Field(default_factory=list)
+    claim_strength: str | None = None  # strong/moderate/weak
+    datasets: list[str] = Field(default_factory=list)
+    evaluation_style: list[str] = Field(default_factory=list)  # [ablation, human_eval, benchmark...]
+    baseline_coverage: str | None = None  # comprehensive/partial/limited
+    risk_profile: list[str] = Field(default_factory=list)  # [reproducibility_risk, ethics_risk...]
+
+
+class PaperCase(BaseModel):
+    """论文记忆案例，存储论文及其审稿关键信息"""
+    case_id: str
+    paper_id: str | None = None
+    venue_id: str | None = None
+    year: int | None = None
+    title: str
+    abstract: str
+    paper_signature: PaperSignature | None = None
+    top_strengths: list[str] = Field(default_factory=list)
+    top_weaknesses: list[str] = Field(default_factory=list)
+    decisive_issues: list[str] = Field(default_factory=list)
+    review_consensus: str | None = None
+    decision: str | None = None
+    rating: float | None = None
+    source_review_ids: list[str] = Field(default_factory=list)
+    transferable_criteria: list[str] = Field(default_factory=list)
+    failure_patterns: list[str] = Field(default_factory=list)
+    embedding: list[float] | None = None
+
+
 class Review(BaseModel):
     review_id: str
     paper_id: str
@@ -42,11 +77,19 @@ class Criterion(BaseModel):
 
 
 class RetrievalBundle(BaseModel):
+    """多通道检索结果"""
     target_paper: Paper
-    related_papers: list[Paper]
-    related_reviews: list[Review]
-    unrelated_papers: list[Paper]
-    venue_policy: VenuePolicy | None
+    # 新增：案例和记忆通道
+    similar_paper_cases: list[PaperCase] = Field(default_factory=list)
+    supporting_papers: list[Paper] = Field(default_factory=list)
+    critique_cases: list["ExperienceCard"] = Field(default_factory=list)
+    policy_cards: list["ExperienceCard"] = Field(default_factory=list)
+    failure_cards: list["ExperienceCard"] = Field(default_factory=list)
+    # 保留原有
+    related_papers: list[Paper] = Field(default_factory=list)
+    related_reviews: list[Review] = Field(default_factory=list)
+    unrelated_papers: list[Paper] = Field(default_factory=list)
+    venue_policy: VenuePolicy | None = None
     trace: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -79,13 +122,63 @@ class CalibrationArtifact(BaseModel):
 
 
 class ExperienceCard(BaseModel):
+    """经验卡片，支持多种类型：policy/case/critique/failure"""
     card_id: str
-    venue_id: str
+    kind: Literal["policy", "case", "critique", "failure"] = "policy"
+    scope: Literal["global", "venue", "paper_type", "domain"] = "venue"
+    venue_id: str | None = None
     theme: str
     content: str
-    kind: Literal["policy"] = "policy"
+    trigger: list[str] = Field(default_factory=list)  # 触发条件
+    utility: float = 0.5
+    confidence: float = 0.5
+    use_count: int = 0
+    source_ids: list[str] = Field(default_factory=list)
     version: int = 1
     active: bool = True
-    quality: float = 0.5
     created_at: datetime = Field(default_factory=datetime.utcnow)
     source_trace: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ActivatedCriterion(BaseModel):
+    """被激活的审稿标准，带优先级和触发条件"""
+    theme: str
+    criterion: str
+    source: str  # memory/mined
+    priority: int = 0
+    trigger_reason: str = ""
+    required_evidence: list[str] = Field(default_factory=list)
+    owner_agent: str | None = None
+
+
+class ScoreConsistencyReport(BaseModel):
+    """评分一致性报告"""
+    similar_review_count: int = 0
+    mean_rating: float | None = None
+    median_rating: float | None = None
+    rating_deviation: float | None = None
+    decision_distribution: dict[str, int] = Field(default_factory=dict)
+    consistency_level: str = "unknown"  # high/medium/low/unknown
+    warning: str | None = None
+    justification_needed: bool = False
+
+
+class DecisionVerificationReport(BaseModel):
+    """决策验证报告"""
+    passed: bool
+    score_text_alignment: str = "unclear"  # aligned/misaligned/unclear
+    evidence_support_level: str = "weak"  # strong/moderate/weak
+    venue_alignment_level: str = "unknown"  # high/medium/low/unknown
+    warnings: list[str] = Field(default_factory=list)
+    requires_revision: bool = False
+
+
+class CalibrationResult(BaseModel):
+    """多路校准结果"""
+    calibrated_rating: float | None = None
+    acceptance_likelihood: float | None = None
+    borderline_likelihood: float | None = None
+    rejection_likelihood: float | None = None
+    calibration_confidence: float | None = None
+    method: str = "ordinal"  # ordinal/three_way/binary

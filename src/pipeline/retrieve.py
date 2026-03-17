@@ -7,9 +7,11 @@ from pathlib import Path
 import numpy as np
 
 from clients.embedding_client import EmbeddingClient, EmbeddingConfig
-from common.types import Paper, Review, RetrievalBundle
+from common.types import ExperienceCard, Paper, PaperCase, PaperSignature, Review, RetrievalBundle
+from storage.case_store import CaseStore
 from storage.doc_store import DocStore
 from storage.faiss_index import FaissIndex
+from storage.memory_store import MemoryStore
 from storage.milvus_store import MilvusConfig, MilvusStore
 
 logger = logging.getLogger(__name__)
@@ -28,14 +30,28 @@ class Retriever:
         embedding_cfg: EmbeddingConfig,
         vector_store: dict | None = None,
         index_root: str = "data/index",
+        case_store: CaseStore | None = None,
+        memory_store: MemoryStore | None = None,
     ) -> None:
         self.venue_id = venue_id
         self.embedding_client = EmbeddingClient(embedding_cfg)
         self.vector_store = vector_store or {}
         self.index_root = Path(index_root)
         self.doc_store = DocStore()
+        self.case_store = case_store
+        self.memory_store = memory_store
 
-    def retrieve(self, target_paper: Paper, top_k_papers: int, top_k_reviews: int, unrelated_k: int, similarity_threshold: float, target_year: int | None) -> RetrievalBundle:
+    def retrieve(
+        self,
+        target_paper: Paper,
+        top_k_papers: int,
+        top_k_reviews: int,
+        unrelated_k: int,
+        similarity_threshold: float,
+        target_year: int | None,
+        paper_signature: PaperSignature | None = None,
+        use_case_memory: bool = True,
+    ) -> RetrievalBundle:
         papers = self.doc_store.load_papers(self.venue_id)
         reviews = self.doc_store.load_reviews(self.venue_id)
         papers_filtered = [p for p in filter_by_year(papers, target_year) if p.paper_id != target_paper.paper_id]
@@ -43,6 +59,7 @@ class Retriever:
 
         backend = self.vector_store.get("backend", "faiss")
         review_index_available = False
+        query_vec: np.ndarray | None = None
         if backend == "milvus":
             milvus_cfg = MilvusConfig(
                 host=self.vector_store.get("host", "localhost"),
@@ -87,13 +104,98 @@ class Retriever:
             unrelated_papers = []
 
         policy = self.doc_store.load_policy(self.venue_id)
+
+        # === Multi-channel retrieval ===
+        similar_paper_cases: list[PaperCase] = []
+        supporting_papers: list[Paper] = []
+        critique_cases: list[ExperienceCard] = []
+        policy_cards: list[ExperienceCard] = []
+        failure_cards: list[ExperienceCard] = []
+
+        # 1. Retrieve similar paper cases
+        if use_case_memory and self.case_store:
+            try:
+                query_text = f"{target_paper.title}\n{target_paper.abstract}"
+                similar_paper_cases = self.case_store.search_similar_cases(
+                    query_text=query_text,
+                    top_k=min(top_k_papers, 5),
+                    venue_id=self.venue_id,
+                    threshold=similarity_threshold,
+                )
+                # Also search by signature if available
+                if paper_signature:
+                    sig_cases = self.case_store.search_by_signature(
+                        signature=paper_signature,
+                        top_k=3,
+                        venue_id=self.venue_id,
+                    )
+                    # Merge and dedupe
+                    existing_ids = {c.case_id for c in similar_paper_cases}
+                    for case in sig_cases:
+                        if case.case_id not in existing_ids:
+                            similar_paper_cases.append(case)
+                logger.info("Retrieved %d similar paper cases", len(similar_paper_cases))
+            except Exception as e:
+                logger.warning("Failed to retrieve paper cases: %s", e)
+
+        # 2. Supporting papers (keep original related_papers)
+        supporting_papers = related_papers
+
+        # 3. Retrieve policy cards from memory
+        if self.memory_store:
+            try:
+                # Get all themes from config or use common themes
+                themes = ["quality", "novelty", "clarity", "significance", "reproducibility", "soundness"]
+                for theme in themes:
+                    cards = self.memory_store.list_active(
+                        venue_id=self.venue_id,
+                        theme=theme,
+                    )
+                    policy_cards.extend(cards)
+                logger.info("Retrieved %d policy cards", len(policy_cards))
+            except Exception as e:
+                logger.warning("Failed to retrieve policy cards: %s", e)
+
+        # 4. Retrieve critique cases (from memory with kind=critique)
+        if self.memory_store:
+            try:
+                critique_cases = [
+                    card for card in self.memory_store.cards
+                    if card.kind == "critique" and card.active and
+                    (card.venue_id is None or card.venue_id == self.venue_id)
+                ][:top_k_reviews]
+                logger.info("Retrieved %d critique cases", len(critique_cases))
+            except Exception as e:
+                logger.warning("Failed to retrieve critique cases: %s", e)
+
+        # 5. Retrieve failure cards (from memory with kind=failure)
+        if self.memory_store:
+            try:
+                failure_cards = [
+                    card for card in self.memory_store.cards
+                    if card.kind == "failure" and card.active and
+                    (card.venue_id is None or card.venue_id == self.venue_id)
+                ][:5]
+                logger.info("Retrieved %d failure cards", len(failure_cards))
+            except Exception as e:
+                logger.warning("Failed to retrieve failure cards: %s", e)
+
         trace = {
             "paper_ids": paper_ids,
             "review_ids": review_ids,
             "filter_year": target_year,
+            "case_ids": [c.case_id for c in similar_paper_cases],
+            "policy_card_ids": [c.card_id for c in policy_cards],
+            "critique_card_ids": [c.card_id for c in critique_cases],
+            "failure_card_ids": [c.card_id for c in failure_cards],
         }
         return RetrievalBundle(
             target_paper=target_paper,
+            similar_paper_cases=similar_paper_cases,
+            supporting_papers=supporting_papers,
+            critique_cases=critique_cases,
+            policy_cards=policy_cards,
+            failure_cards=failure_cards,
             related_papers=related_papers,
             related_reviews=related_reviews,
             unrelated_papers=unrelated_papers,
