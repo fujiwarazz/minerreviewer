@@ -17,7 +17,13 @@ class CriteriaRewriter:
             return []
         prompt = self._prompt(target, criteria)
         response = self.llm.generate_json(prompt)
-        rewritten = response.get("criteria", [])
+
+        # Handle both list and dict response formats
+        if isinstance(response, list):
+            rewritten = response
+        else:
+            rewritten = response.get("criteria", [])
+
         result: list[Criterion] = []
         for original, item in zip(criteria, rewritten):
             # Handle case where item might be a string or dict
