@@ -3,12 +3,14 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import requests
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,7 @@ class EmbeddingClient:
 
     def _sentence_transformers_embed(self, texts: list[str]) -> np.ndarray:
         if self._local_model is None:
+            from sentence_transformers import SentenceTransformer
             self._local_model = SentenceTransformer(self.config.model)
         return self._local_model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
 

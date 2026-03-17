@@ -21,6 +21,7 @@ class LLMConfig:
     base_url: str = "https://api.openai.com/v1"
     dashscope_url: str = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation"
     api_key_env: str = "OPENAI_API_KEY"
+    api_key: str | None = None  # Direct API key from config
 
 
 class LLMClient:
@@ -48,9 +49,9 @@ class LLMClient:
         return self._parse_json(raw)
 
     def _openai_generate(self, prompt: str, json_mode: bool = False) -> str:
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key = self.config.api_key or os.getenv(self.config.api_key_env)
         if not api_key:
-            raise RuntimeError("OPENAI_API_KEY not set")
+            raise RuntimeError(f"API key not set (config.api_key or {self.config.api_key_env})")
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload: dict[str, Any] = {
             "model": self.config.model,
@@ -68,9 +69,9 @@ class LLMClient:
         return data["choices"][0]["message"]["content"]
 
     def _openai_sdk_generate(self, prompt: str, json_mode: bool = False) -> str:
-        api_key = os.getenv(self.config.api_key_env)
+        api_key = self.config.api_key or os.getenv(self.config.api_key_env)
         if not api_key:
-            raise RuntimeError(f"{self.config.api_key_env} not set")
+            raise RuntimeError(f"API key not set (config.api_key or {self.config.api_key_env})")
         client = OpenAI(api_key=api_key, base_url=self.config.base_url)
         response_format = {"type": "json_object"} if json_mode else None
         response = client.chat.completions.create(

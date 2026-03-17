@@ -36,9 +36,11 @@ calibration:
   method: "isotonic"
   min_history: 100
 llm:
-  backend: "dashscope"
+  backend: "openai"
   model: "qwen-plus"
   temperature: 0.1
+  base_url: "https://one-api.bltcy.top/v1"
+  api_key: "sk-U3otxTRGBFKnriR9ANwXAhIgVgIRJK2NHY3yQfYX5eYMinV4"
 memory:
   store_path: "data/processed/memory_store.json"
   similarity_threshold: 0.7

@@ -78,35 +78,164 @@ def load_parquet_ground_truth(path: str | Path, row_index: int = 0) -> list[dict
         raise IndexError(f"row_index {row_index} out of range for {path}")
     row = df.iloc[row_index]
     decision = row.get("decision")
-    raw = row.get("reviews_json")
-    if _is_empty(raw):
-        return []
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
+
     outputs: list[dict[str, Any]] = []
-    for entry in parsed if isinstance(parsed, list) else []:
-        content = entry.get("content") if isinstance(entry, dict) else None
-        if not isinstance(content, dict):
-            continue
-        strengths = content.get("strengths")
-        weaknesses = content.get("weaknesses")
-        rating_value = None
-        scores = entry.get("scores") if isinstance(entry.get("scores"), dict) else {}
-        if isinstance(scores, dict):
-            rating_value = scores.get("rating", {}).get("value") if isinstance(scores.get("rating"), dict) else None
-        outputs.append(
-            {
-                "reply_id": entry.get("reply_id"),
-                "strengths": strengths,
-                "weaknesses": weaknesses,
-                "rating": rating_value,
-                "confidence": scores.get("confidence", {}).get("value") if isinstance(scores.get("confidence"), dict) else None,
-                "decision": decision,
-            }
-        )
+
+    # Try reviews_json first
+    raw = row.get("reviews_json")
+    if not _is_empty(raw):
+        try:
+            parsed = json.loads(raw)
+            for entry in parsed if isinstance(parsed, list) else []:
+                content = entry.get("content") if isinstance(entry, dict) else None
+                if not isinstance(content, dict):
+                    continue
+                strengths = content.get("strengths")
+                weaknesses = content.get("weaknesses")
+                rating_value = None
+                scores = entry.get("scores") if isinstance(entry.get("scores"), dict) else {}
+                if isinstance(scores, dict):
+                    rating_value = scores.get("rating", {}).get("value") if isinstance(scores.get("rating"), dict) else None
+                outputs.append(
+                    {
+                        "reply_id": entry.get("reply_id"),
+                        "strengths": strengths,
+                        "weaknesses": weaknesses,
+                        "rating": rating_value,
+                        "confidence": scores.get("confidence", {}).get("value") if isinstance(scores.get("confidence"), dict) else None,
+                        "decision": decision,
+                    }
+                )
+            if outputs:
+                return outputs
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Try summary_review (often a dict with strengths/weaknesses)
+    summary = row.get("summary_review")
+    if isinstance(summary, dict):
+        strengths = summary.get("strengths")
+        weaknesses = summary.get("weaknesses")
+        if hasattr(strengths, 'tolist'):
+            strengths = strengths.tolist()
+        if hasattr(weaknesses, 'tolist'):
+            weaknesses = weaknesses.tolist()
+        outputs.append({
+            "strengths": _format_points(strengths),
+            "weaknesses": _format_points(weaknesses),
+            "rating": summary.get("rating"),
+            "decision": decision,
+        })
+
+    # Try review (can be numpy array of strings)
+    review_val = row.get("review")
+    if hasattr(review_val, '__iter__') and not isinstance(review_val, str):
+        for item in review_val:
+            if isinstance(item, str):
+                strengths, weaknesses = _extract_sections(item)
+                rating = _extract_rating(item)
+                confidence = _extract_confidence(item)
+                outputs.append({
+                    "strengths": strengths,
+                    "weaknesses": weaknesses,
+                    "rating": rating,
+                    "confidence": confidence,
+                    "decision": decision,
+                    "text": item,
+                })
+
+    # Try meta_review
+    meta = row.get("meta_review")
+    if isinstance(meta, str) and meta.strip():
+        strengths, weaknesses = _extract_sections(meta)
+        rating = _extract_rating(meta)
+        outputs.append({
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "rating": rating,
+            "decision": decision,
+            "text": meta,
+        })
+
     return outputs
+
+
+def _extract_rating(text: str) -> float | None:
+    """Extract rating from review text.
+
+    Handles formats like:
+    - "**rating:**\n\n5: marginally below the acceptance threshold"
+    - "Rating: 5"
+    - "rating: 5: some text"
+    """
+    import re
+    # Match **rating:** (colon before **) followed by optional whitespace/newlines, then number
+    match = re.search(r'\*\*rating:\*\*\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
+    # Match **rating**:\s*number (colon after **)
+    match = re.search(r'\*\*rating\*\*:\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
+    # Match rating: followed by number
+    match = re.search(r'rating[:\s]+\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
+    return None
+
+
+def _extract_confidence(text: str) -> float | None:
+    """Extract confidence from review text."""
+    import re
+    # Match **confidence:** format
+    match = re.search(r'\*\*confidence:\*\*\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
+    # Match **confidence**:\s*number
+    match = re.search(r'\*\*confidence\*\*:\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
+    # Match confidence: followed by number
+    match = re.search(r'confidence[:\s]+\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+
+    return None
+
+
+def _format_points(value: Any) -> str | None:
+    """Format strengths/weaknesses to a string."""
+    if value is None:
+        return None
+    if hasattr(value, 'tolist'):
+        value = value.tolist()
+    if isinstance(value, list):
+        return "@@".join(str(item) for item in value if item)
+    return str(value)
+
+
+def _extract_sections(text: str) -> tuple[str | None, str | None]:
+    """Extract strengths and weaknesses sections from text."""
+    import re
+    strengths = None
+    weaknesses = None
+
+    # Try to find strengths section
+    strength_match = re.search(r'\*\*strengths?\*\*:?\s*(.*?)(?=\*\*weaknesses?\*\*|$)', text, re.IGNORECASE | re.DOTALL)
+    if strength_match:
+        strengths = strength_match.group(1).strip()
+
+    # Try to find weaknesses section
+    weakness_match = re.search(r'\*\*weaknesses?\*\*:?\s*(.*?)(?=\*\*|$)', text, re.IGNORECASE | re.DOTALL)
+    if weakness_match:
+        weaknesses = weakness_match.group(1).strip()
+
+    return strengths, weaknesses
 
 
 def _extract_reviews(row: pd.Series) -> list[tuple[str, float | None]]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from agents.arbiter_agent import ArbiterAgent
@@ -183,11 +184,15 @@ class ReviewPipeline:
         for theme in criteria_themes:
             if theme not in themes:
                 themes.append(theme)
-        outputs = []
         review_cfg = self.config.get("review", {})
         use_fulltext = bool(review_cfg.get("use_fulltext", False))
         max_fulltext_chars = int(review_cfg.get("max_fulltext_chars", 12000))
-        for theme in themes:
+
+        # Parallel execution of theme agents
+        outputs: list[ThemeOutput] = []
+        max_workers = min(len(themes), 6)  # Limit concurrent threads
+
+        def review_theme(theme: str) -> ThemeOutput:
             themed = [c for c in criteria if c.theme == theme]
             agent = ThemeAgent(
                 AgentConfig(name=f"theme_{theme}", llm=self.llm),
@@ -195,7 +200,22 @@ class ReviewPipeline:
                 use_fulltext=use_fulltext,
                 max_fulltext_chars=max_fulltext_chars,
             )
-            outputs.append(agent.review(target, themed))
+            return agent.review(target, themed)
+
+        if max_workers > 1 and len(themes) > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(review_theme, theme): theme for theme in themes}
+                for future in as_completed(futures):
+                    try:
+                        outputs.append(future.result())
+                    except Exception as e:
+                        theme = futures[future]
+                        logger.error("Theme agent %s failed: %s", theme, e)
+        else:
+            # Fallback to sequential for single theme or safety
+            for theme in themes:
+                outputs.append(review_theme(theme))
+
         return outputs
 
     @staticmethod

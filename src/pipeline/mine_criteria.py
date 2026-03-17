@@ -11,6 +11,18 @@ from storage.milvus_store import MilvusConfig, MilvusStore
 
 logger = logging.getLogger(__name__)
 
+# Standard ICLR review criteria themes
+ICLR_CRITERIA_THEMES = {
+    "Quality": "Technical soundness, correctness of methods and claims",
+    "Clarity": "Paper writing quality, organization, and presentation",
+    "Originality": "Novelty of ideas, methods, or insights",
+    "Significance": "Importance and impact of contributions",
+    "Reproducibility": "Sufficiency of details to reproduce results",
+    "Related Work": "Adequate coverage and comparison to prior work",
+    "Experiments": "Quality and comprehensiveness of empirical evaluation",
+    "Ethics": "Ethical considerations and potential negative impact",
+}
+
 
 class CriteriaMiner:
     def __init__(
@@ -67,23 +79,54 @@ class CriteriaMiner:
 
     @staticmethod
     def _content_prompt(target: Paper, related_papers: list[Paper], related_reviews: list[Review], gap_context: str) -> str:
-        paper_snippets = [f"- {paper.title}: {paper.abstract[:500]}" for paper in related_papers]
-        review_snippets = [f"- {review.text}" for review in related_reviews]
-        return "\n".join(
-            [
-                "You are mining content-evaluation criteria for an ICLR review.",
-                "Write criteria as concise review questions/checks (not summaries).",
-                "Format each criterion as an evaluative question or if/then rule, e.g.,",
-                "\"If the authors claim X, do the experiments provide Y evidence?\"",
-                "Avoid paper-specific claims; focus on verifiable standards.",
-                f"Target paper: {target.title}\n{target.abstract}",
-                "Related papers:",
-                *paper_snippets,
-                "Related reviews:",
-                *review_snippets,
-                "Return JSON with key 'criteria': list of {text, theme, source_ids}.",
-            ]
-        )
+        paper_snippets = [f"- {paper.title}: {paper.abstract[:500]}" for paper in related_papers[:3]]
+        review_snippets = [f"- {review.text[:400]}" for review in related_reviews[:6]]
+
+        # Build standard criteria reference
+        criteria_ref = "\n".join([f"- {k}: {v}" for k, v in ICLR_CRITERIA_THEMES.items()])
+
+        return "\n".join([
+            "You are an expert ICLR reviewer extracting EVALUATION CRITERIA from related work.",
+            "",
+            "## Standard ICLR Review Themes",
+            criteria_ref,
+            "",
+            "## Your Task",
+            "Generate 5-8 specific, verifiable criteria that a reviewer should check for this paper.",
+            "Each criterion should be:",
+            "1. A concrete question or checklist item (NOT a summary of the paper)",
+            "2. Verifiable from the paper content (NOT subjective preference)",
+            "3. General enough to apply to similar papers (NOT paper-specific details)",
+            "",
+            "## Good Criteria Examples:",
+            "- \"Does the paper provide a clear problem formulation with formal notation?\"",
+            "- \"Are the baseline methods fairly compared with identical evaluation protocols?\"",
+            "- \"Does the method section include algorithmic complexity analysis?\"",
+            "- \"Are there ablation studies isolating each proposed component's contribution?\"",
+            "",
+            "## Bad Criteria Examples (AVOID):",
+            "- \"The paper proposes X method\" (this is a summary, not a criterion)",
+            "- \"Does the paper use dataset Y?\" (too specific to this paper)",
+            "- \"Is the writing good?\" (too vague, not verifiable)",
+            "",
+            "## Target Paper to Review",
+            f"Title: {target.title}",
+            f"Abstract: {target.abstract}",
+            "",
+            "## Related Papers (for context)",
+            *paper_snippets,
+            "",
+            "## Related Reviews (for patterns)",
+            *review_snippets,
+            "",
+            f"{gap_context}",
+            "",
+            "## Output Format",
+            "Return JSON with key 'criteria': list of objects with:",
+            "- text: the criterion as a question or checklist item",
+            "- theme: one of Quality, Clarity, Originality, Significance, Reproducibility, Related Work, Experiments, Ethics",
+            "- source_ids: list of review indices that inspired this criterion (e.g., ['review_1', 'review_3'])",
+        ])
 
     def _coverage_gap_context(self, target: Paper) -> str:
         if self.vector_store.get("backend") != "milvus" or self.embedding_client is None:
@@ -108,23 +151,39 @@ class CriteriaMiner:
     @staticmethod
     def _policy_prompt(venue_policy: VenuePolicy | None, random_reviews: list[Review]) -> str:
         policy_text = json.dumps(venue_policy.model_dump() if venue_policy else {}, ensure_ascii=True)
-        review_snippets = [f"- {review.text[:240]}" for review in random_reviews]
-        return "\n".join(
-            [
-                "You are mining review style criteria for ICLR-style reviews.",
-                "Only output review-writing norms: structure, tone, evidence style, clarity, and meeting-oriented expectations.",
-                "Do NOT mention specific paper topics, methods, datasets, or claims.",
-                "Few-shot examples (style-only, abstracted):",
-                "1) \"If a weakness is raised, it should be tied to a concrete missing experiment or unclear claim.\"",
-                "2) \"Summaries should be brief and factual before listing strengths/weaknesses.\"",
-                "3) \"Claims should be supported by explicit evidence or citations from the paper.\"",
-                "4) \"Avoid speculative statements; state uncertainty when evidence is limited.\"",
-                f"Venue policy: {policy_text}",
-                "Random review excerpts:",
-                *review_snippets,
-                "Return JSON with key 'criteria': list of {text, theme, source_ids} focusing on style and structure only.",
-            ]
-        )
+        review_snippets = [f"- {review.text[:300]}" for review in random_reviews[:6]]
+
+        return "\n".join([
+            "You are extracting REVIEW STYLE GUIDELINES from ICLR reviews.",
+            "",
+            "## Your Task",
+            "Extract 4-6 style/format guidelines that define what makes a good ICLR review.",
+            "These should be about HOW to write reviews, NOT what specific content to mention.",
+            "",
+            "## Good Policy Examples:",
+            "- \"Each weakness should cite a specific section/equation/experiment from the paper\"",
+            "- \"Strengths should be stated before weaknesses in the review\"",
+            "- \"Avoid absolute language; use 'may' or 'appears to' for uncertain claims\"",
+            "- \"Include specific suggestions for improvement, not just criticism\"",
+            "- \"Rating should align with the severity of weaknesses identified\"",
+            "",
+            "## Bad Policy Examples (AVOID):",
+            "- \"Mention the dataset used\" (this is content-specific, not style)",
+            "- \"Check if the method is novel\" (this is a content criterion, not style)",
+            "- \"The paper should be accepted\" (this is a decision, not a guideline)",
+            "",
+            "## Venue Policy",
+            f"{policy_text}",
+            "",
+            "## Sample Reviews",
+            *review_snippets,
+            "",
+            "## Output Format",
+            "Return JSON with key 'criteria': list of objects with:",
+            "- text: the style guideline",
+            "- theme: 'Style', 'Structure', 'Tone', or 'Evidence'",
+            "- source_ids: list of review indices",
+        ])
 
     def _filter_policy(self, criteria: list[Criterion]) -> list[Criterion]:
         if not criteria:
