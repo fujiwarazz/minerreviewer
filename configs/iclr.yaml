@@ -20,7 +20,7 @@ distill:
   max_per_theme: 4
   dedup_threshold: 0.86
   seed: 42
-  strategy: "max_volume"
+  strategy: "random"
   epsilon: 1.0
 policy_mining:
   sample_accept: 3

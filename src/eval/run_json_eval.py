@@ -136,7 +136,8 @@ def run_evaluation(
             print(f"[{i+1}/{len(sampled_papers)}] Processing: {paper.title[:60]}...")
 
             start_time = time.time()
-            output = pipeline._run_review(paper, paper.year)
+            # Use target_year=None to avoid year filtering issues
+            output = pipeline._run_review(paper, target_year=None)
             elapsed = time.time() - start_time
 
             outputs.append(output)
