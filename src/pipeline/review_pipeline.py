@@ -118,19 +118,30 @@ class ReviewPipeline:
         # 8. Verify decision
         verification = self._verify_decision(arbiter_output, target, bundle)
 
-        # 9. Check score consistency (只警告，不改分)
+        # 9. If verification requires revision, trigger arbiter revise
+        if verification.requires_revision:
+            arbiter_output = self._revise_decision(
+                arbiter_output, target, verification, bundle, theme_outputs
+            )
+            # Re-verify after revision
+            verification = self._verify_decision(arbiter_output, target, bundle)
+
+        # 10. Check score consistency (只警告，不改分)
         consistency = self._check_score_consistency(arbiter_output, bundle)
 
-        # 10. Calibrate (多路校准)
+        # 11. Calibrate (多路校准)
         calibration = self._calibrate_multiclass(arbiter_output.raw_rating, target_year)
 
-        # 11. Distill experience
+        # 12. Apply calibration to final output (回填校准结果)
+        arbiter_output = self._apply_calibration(arbiter_output, calibration)
+
+        # 13. Distill experience
         experience = self._distill_experience(arbiter_output, target, signature, bundle)
 
-        # 12. Update memory
+        # 14. Update memory
         memory_updates = self._update_memory(experience)
 
-        # 13. Build trace
+        # 15. Build final report
         arbiter_output.raw_decision = arbiter_output.decision_recommendation
         arbiter_output.trace.update({
             "paper_signature": signature.model_dump() if signature else {},
@@ -140,6 +151,12 @@ class ReviewPipeline:
             "calibration": calibration.model_dump(),
             "memory_updates": memory_updates,
             "activated_criteria": [c.model_dump() for c in activated[:10]],
+            "final_decision_flow": {
+                "initial_rating": arbiter_output.raw_rating,
+                "was_revised": verification.requires_revision,
+                "calibrated_acceptance": arbiter_output.acceptance_likelihood,
+                "consistency_warning": consistency.warning,
+            },
         })
 
         return arbiter_output
@@ -386,3 +403,123 @@ class ReviewPipeline:
                 outputs.append(review_theme(theme))
 
         return outputs
+
+    def _revise_decision(
+        self,
+        arbiter_output: ArbiterOutput,
+        paper: Paper,
+        verification: DecisionVerificationReport,
+        bundle,
+        theme_outputs: list[ThemeOutput],
+    ) -> ArbiterOutput:
+        """
+        当 verification.requires_revision 时，触发 arbiter revise
+
+        这是决策链的关键闭环：verification 诊断会真正影响最终决策
+        """
+        logger.warning(
+            "Decision verification requires revision: %s",
+            verification.warnings
+        )
+
+        # Build revision context
+        revision_prompt = self._build_revision_prompt(
+            arbiter_output, paper, verification, bundle
+        )
+
+        try:
+            response = self.llm.generate_json(revision_prompt)
+
+            # Update arbiter output with revision
+            if "raw_rating" in response:
+                old_rating = arbiter_output.raw_rating
+                arbiter_output.raw_rating = float(response["raw_rating"])
+                logger.info("Rating revised: %.1f -> %.1f", old_rating, arbiter_output.raw_rating)
+
+            if "decision_recommendation" in response:
+                old_decision = arbiter_output.decision_recommendation
+                arbiter_output.decision_recommendation = response["decision_recommendation"]
+                logger.info("Decision revised: %s -> %s", old_decision, arbiter_output.decision_recommendation)
+
+            if "revised_strengths" in response:
+                arbiter_output.strengths = response["revised_strengths"]
+
+            if "revised_weaknesses" in response:
+                arbiter_output.weaknesses = response["revised_weaknesses"]
+
+            # Record revision in trace
+            arbiter_output.trace["revision"] = {
+                "reason": verification.warnings,
+                "old_rating": arbiter_output.trace.get("initial_rating"),
+                "new_rating": arbiter_output.raw_rating,
+            }
+
+        except Exception as e:
+            logger.error("Failed to revise decision: %s", e)
+            # Keep original output if revision fails
+
+        return arbiter_output
+
+    def _build_revision_prompt(
+        self,
+        arbiter_output: ArbiterOutput,
+        paper: Paper,
+        verification: DecisionVerificationReport,
+        bundle,
+    ) -> str:
+        """构建修订提示"""
+        return "\n".join([
+            "The initial review decision has failed verification. Please revise based on the following issues:",
+            "",
+            f"Paper: {paper.title}",
+            "",
+            "Initial Review:",
+            f"- Rating: {arbiter_output.raw_rating}",
+            f"- Decision: {arbiter_output.decision_recommendation}",
+            f"- Strengths: {arbiter_output.strengths[:3]}",
+            f"- Weaknesses: {arbiter_output.weaknesses[:3]}",
+            "",
+            "Verification Issues:",
+            *[f"- {w}" for w in verification.warnings],
+            "",
+            f"Score-Text Alignment: {verification.score_text_alignment}",
+            f"Evidence Support: {verification.evidence_support_level}",
+            "",
+            "Please revise and return JSON with:",
+            "- raw_rating (float): revised rating",
+            "- decision_recommendation (string): accept/reject/borderline",
+            "- revised_strengths (list, optional): updated strengths",
+            "- revised_weaknesses (list, optional): updated weaknesses",
+        ])
+
+    def _apply_calibration(
+        self,
+        arbiter_output: ArbiterOutput,
+        calibration: CalibrationResult,
+    ) -> ArbiterOutput:
+        """
+        把 calibration 结果回填到最终输出字段
+
+        这是另一个关键闭环：calibration 不仅仅是诊断，而是真正影响最终输出
+        """
+        # Update acceptance likelihood
+        arbiter_output.acceptance_likelihood = calibration.acceptance_likelihood
+
+        # Update calibrated rating
+        if calibration.calibrated_rating is not None:
+            arbiter_output.calibrated_rating = calibration.calibrated_rating
+
+        # Add borderline likelihood if available (three-way calibration)
+        if calibration.borderline_likelihood is not None:
+            arbiter_output.trace["borderline_likelihood"] = calibration.borderline_likelihood
+            arbiter_output.trace["rejection_likelihood"] = calibration.rejection_likelihood
+
+        # Derive final decision from calibration if confidence is high
+        if calibration.calibration_confidence and calibration.calibration_confidence > 0.7:
+            if calibration.acceptance_likelihood and calibration.acceptance_likelihood > 0.6:
+                # Don't override, but note the calibration suggests accept
+                arbiter_output.trace["calibration_suggestion"] = "accept"
+            elif calibration.rejection_likelihood and calibration.rejection_likelihood > 0.6:
+                arbiter_output.trace["calibration_suggestion"] = "reject"
+
+        return arbiter_output
