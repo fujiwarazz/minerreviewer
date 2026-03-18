@@ -21,6 +21,7 @@ class CriteriaPlanner:
         signature: PaperSignature | None,
         bundle: RetrievalBundle,
         mined_criteria: list[Criterion],
+        mined_policy_criteria: list[Criterion] | None = None,
         max_criteria: int = 15,
         priority_boost_memory: float = 1.5,
     ) -> list[ActivatedCriterion]:
@@ -30,7 +31,8 @@ class CriteriaPlanner:
         Args:
             signature: 论文结构化特征
             bundle: 多通道检索结果
-            mined_criteria: 从历史数据挖掘的标准
+            mined_criteria: 从历史数据挖掘的内容标准
+            mined_policy_criteria: 从历史数据挖掘的策略标准
             max_criteria: 最大标准数量
             priority_boost_memory: 记忆来源的优先级加成
 
@@ -38,26 +40,26 @@ class CriteriaPlanner:
             激活的标准列表，按优先级排序
         """
         activated: list[ActivatedCriterion] = []
+        mined_policy_criteria = mined_policy_criteria or []
 
-        # 1. Add criteria from policy cards (memory)
+        # 1. Add criteria from policy cards (memory) - venue-aware policy memory
         for card in bundle.policy_cards:
             priority = int(card.utility * 10 * priority_boost_memory)
             activated.append(ActivatedCriterion(
                 theme=card.theme,
                 criterion=card.content,
-                source="memory",
+                source="policy_memory",  # 明确标记来源
                 priority=priority,
-                trigger_reason=f"Retrieved from memory with utility={card.utility:.2f}",
+                trigger_reason=f"Retrieved from venue policy memory (venue={card.venue_id}, utility={card.utility:.2f})",
                 required_evidence=card.trigger,
                 owner_agent=f"theme_{card.theme}",
             ))
             # Update use count
             card.use_count += 1
 
-        # 2. Add criteria from similar paper cases
+        # 2. Add criteria from similar paper cases (case-driven evidence)
         for case in bundle.similar_paper_cases:
             for criterion_text in case.transferable_criteria:
-                # Determine theme based on content
                 theme = self._infer_theme(criterion_text)
                 priority = 5  # Base priority for case-based criteria
                 if case.decision == "reject":
@@ -65,7 +67,7 @@ class CriteriaPlanner:
                 activated.append(ActivatedCriterion(
                     theme=theme,
                     criterion=criterion_text,
-                    source="memory",
+                    source="case_memory",
                     priority=priority,
                     trigger_reason=f"Transferred from similar case {case.case_id[:8]} (decision={case.decision})",
                     owner_agent=f"theme_{theme}",
@@ -77,33 +79,51 @@ class CriteriaPlanner:
             activated.append(ActivatedCriterion(
                 theme=theme,
                 criterion=card.content,
-                source="memory",
+                source="failure_memory",
                 priority=8,  # High priority for failure patterns
                 trigger_reason=f"Failure pattern: {card.trigger}",
                 required_evidence=card.trigger,
                 owner_agent=f"theme_{theme}",
             ))
 
-        # 4. Add mined criteria
+        # 4. Add mined policy criteria (mined from accept/reject reviews)
+        for criterion in mined_policy_criteria:
+            priority = 6  # Higher priority than content criteria
+            activated.append(ActivatedCriterion(
+                theme=criterion.theme,
+                criterion=criterion.text,
+                source="policy_mined",
+                priority=priority,
+                trigger_reason=f"Mined from {criterion.kind} criteria (venue policy)",
+                owner_agent=f"theme_{criterion.theme}",
+            ))
+
+        # 5. Add mined content criteria
         for criterion in mined_criteria:
             priority = 3  # Base priority for mined criteria
             activated.append(ActivatedCriterion(
                 theme=criterion.theme,
                 criterion=criterion.text,
-                source="mined",
+                source="content_mined",
                 priority=priority,
                 trigger_reason=f"Mined from {criterion.kind} criteria",
                 owner_agent=f"theme_{criterion.theme}",
             ))
 
-        # 5. Deduplicate and merge similar criteria
+        # 6. Deduplicate and merge similar criteria
         activated = self._deduplicate(activated)
 
-        # 6. Sort by priority and limit
+        # 7. Sort by priority and limit
         activated.sort(key=lambda x: x.priority, reverse=True)
         activated = activated[:max_criteria]
 
-        logger.info("Planned %d activated criteria", len(activated))
+        # Log source distribution
+        source_counts = Counter(c.source for c in activated)
+        logger.info(
+            "Planned %d activated criteria: %s",
+            len(activated),
+            dict(source_counts)
+        )
         return activated
 
     def _infer_theme(self, criterion_text: str) -> str:

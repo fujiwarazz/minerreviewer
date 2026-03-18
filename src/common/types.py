@@ -103,6 +103,7 @@ class ThemeOutput(BaseModel):
 
 
 class ArbiterOutput(BaseModel):
+    """Arbiter 输出，包含可解释性字段"""
     strengths: list[str]
     weaknesses: list[str]
     raw_rating: float
@@ -110,6 +111,12 @@ class ArbiterOutput(BaseModel):
     raw_decision: str | None = None
     calibrated_rating: float | None = None
     acceptance_likelihood: float | None = None
+    # 可解释性字段
+    decision_rationale: str | None = None  # 决策理由
+    score_rationale: str | None = None  # 评分理由
+    key_decisive_issues: list[str] = Field(default_factory=list)  # 决定性问题
+    verification_summary: str | None = None  # 验证摘要
+    consistency_summary: str | None = None  # 一致性摘要
     trace: dict[str, Any] = Field(default_factory=dict)
 
 

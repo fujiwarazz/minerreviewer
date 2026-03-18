@@ -1,10 +1,20 @@
+# MinerReview Configuration Template
+# Copy this file to iclr.yaml and fill in your environment variables
+
 venue_id: "ICLR"
+
 retrieval:
   top_k_papers: 4
   top_k_reviews: 12
-  unrelated_k: 0  # 不再需要 unrelated papers
+  unrelated_k: 0  # No longer needed
   similarity_threshold: 0.35
-  use_case_memory: true
+  use_case_memory: true  # Enable case-based retrieval
+  # Hybrid retrieval settings
+  case_rerank_enabled: true  # Enable embedding + signature fusion
+  case_embedding_weight: 0.5  # Embedding score weight
+  case_signature_weight: 0.4  # Signature score weight
+  case_venue_match_bonus: 0.1  # Venue match bonus
+
 vector_store:
   backend: "milvus"
   host: "${MILVUS_HOST:localhost}"
@@ -12,10 +22,12 @@ vector_store:
   papers_collection: "papers_iclr"
   reviews_collection: "reviews_iclr"
   coverage_gaps_collection: "coverage_gaps_iclr"
+
 embedding:
   backend: "vllm"
   model: "${EMBEDDING_MODEL:bge-embedding}"
   vllm_base_url: "${EMBEDDING_BASE_URL:http://localhost:8001/v1}"
+
 distill:
   max_total: 12
   max_per_theme: 4
@@ -23,26 +35,37 @@ distill:
   seed: 42
   strategy: "random"
   epsilon: 1.0
+
 policy_mining:
   sample_accept: 3
   sample_reject: 3
+
+# Score consistency check (replaces old decision_scoring)
 score_consistency:
   rating_tolerance: 1.5
   deviation_threshold: 2.0
   min_samples: 3
+  prefer_cases: true  # Prefer case-level stats over reviews
+
 review:
   use_fulltext: true
   max_fulltext_chars: 12000
+
 themes: []
+
 calibration:
   method: "isotonic"
   mode: "ordinal"  # ordinal/three_way/binary
   min_history: 100
+
 llm:
   backend: "${LLM_BACKEND:openai}"
   model: "${LLM_MODEL:qwen-plus}"
   temperature: 0.1
-  base_url: "${LLM_BASE_URL}"
+  base_url: "${LLM_BASE_URL:}"
+  # API key from environment variable - NEVER commit plaintext keys
+  api_key: "${OPENAI_API_KEY:}"
+
 memory:
   store_path: "data/processed/memory_store.json"
   case_store_path: "data/processed/cases.jsonl"
@@ -53,6 +76,7 @@ memory:
   short_term_utility_threshold: 0.3
   long_term_utility_threshold: 0.6
   short_term_ttl_days: 30
+
 coverage_eval:
   enabled: true
   method: "llm"

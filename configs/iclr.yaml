@@ -6,6 +6,11 @@ retrieval:
   unrelated_k: 0  # 不再需要 unrelated papers
   similarity_threshold: 0.35
   use_case_memory: true  # 启用 case-based retrieval
+  # Hybrid retrieval 配置
+  case_rerank_enabled: true  # 启用 embedding + signature 融合
+  case_embedding_weight: 0.5  # embedding 分数权重
+  case_signature_weight: 0.4  # signature 分数权重
+  case_venue_match_bonus: 0.1  # venue 匹配奖励
 
 vector_store:
   backend: "milvus"

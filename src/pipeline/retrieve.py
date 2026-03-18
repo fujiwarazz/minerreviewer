@@ -107,34 +107,34 @@ class Retriever:
 
         # === Multi-channel retrieval ===
         similar_paper_cases: list[PaperCase] = []
+        case_scores: list[dict] = []  # 记录分数用于 trace
         supporting_papers: list[Paper] = []
         critique_cases: list[ExperienceCard] = []
         policy_cards: list[ExperienceCard] = []
         failure_cards: list[ExperienceCard] = []
 
-        # 1. Retrieve similar paper cases
+        # 1. Retrieve similar paper cases with hybrid retrieval
         if use_case_memory and self.case_store:
             try:
                 query_text = f"{target_paper.title}\n{target_paper.abstract}"
-                similar_paper_cases = self.case_store.search_similar_cases(
+                use_hybrid = self.vector_store.get("case_rerank_enabled", True)
+                results = self.case_store.retrieve_cases(
                     query_text=query_text,
+                    signature=paper_signature,
                     top_k=min(top_k_papers, 5),
                     venue_id=self.venue_id,
-                    threshold=similarity_threshold,
+                    use_hybrid=use_hybrid,
                 )
-                # Also search by signature if available
-                if paper_signature:
-                    sig_cases = self.case_store.search_by_signature(
-                        signature=paper_signature,
-                        top_k=3,
-                        venue_id=self.venue_id,
-                    )
-                    # Merge and dedupe
-                    existing_ids = {c.case_id for c in similar_paper_cases}
-                    for case in sig_cases:
-                        if case.case_id not in existing_ids:
-                            similar_paper_cases.append(case)
-                logger.info("Retrieved %d similar paper cases", len(similar_paper_cases))
+                similar_paper_cases = [case for case, _ in results]
+                case_scores = [
+                    {"case_id": case.case_id, "scores": scores}
+                    for case, scores in results
+                ]
+                logger.info(
+                    "Retrieved %d similar paper cases (hybrid=%s)",
+                    len(similar_paper_cases),
+                    use_hybrid,
+                )
             except Exception as e:
                 logger.warning("Failed to retrieve paper cases: %s", e)
 
@@ -185,6 +185,7 @@ class Retriever:
             "review_ids": review_ids,
             "filter_year": target_year,
             "case_ids": [c.case_id for c in similar_paper_cases],
+            "case_scores": case_scores,  # 新增：记录 embedding/signature/final 分数
             "policy_card_ids": [c.card_id for c in policy_cards],
             "critique_card_ids": [c.card_id for c in critique_cases],
             "failure_card_ids": [c.card_id for c in failure_cards],
