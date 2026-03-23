@@ -37,6 +37,7 @@ from pipeline.verify_decision import DecisionVerifier
 from storage.case_store import CaseStore
 from storage.doc_store import DocStore
 from storage.memory_store import MemoryStore
+from storage.milvus_store import MilvusConfig
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,12 @@ class ReviewPipeline:
         self.case_store = CaseStore(
             memory_cfg.get("case_store_path", "data/processed/cases.jsonl"),
             embedding_client=self.embedding_client,
+            milvus_config=MilvusConfig(
+                host=self.config.get("vector_store", {}).get("host", "localhost"),
+                port=int(self.config.get("vector_store", {}).get("port", 19530)),
+                papers_collection="",
+                reviews_collection="",
+            ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
         )
 
     def _init_components(self) -> None:
@@ -114,7 +121,8 @@ class ReviewPipeline:
 
         # 7. Aggregate with arbiter (now includes policy_criteria and venue_policy)
         arbiter_output = self._aggregate(
-            theme_outputs, bundle.policy_cards, policy_criteria, bundle.venue_policy
+            theme_outputs, bundle.policy_cards, policy_criteria, bundle.venue_policy,
+            similar_cases=bundle.similar_paper_cases,
         )
 
         # 8. Verify decision
@@ -309,11 +317,13 @@ class ReviewPipeline:
         policy_cards: list,
         policy_criteria: list[Criterion],
         venue_policy,
+        similar_cases: list[PaperCase] | None = None,
     ) -> ArbiterOutput:
         """
         聚合主题输出
 
         现在真正使用 policy_criteria 和 venue_policy 进入最终决策
+        同时参考相似案例的评分分布来校准打分
         """
         arbiter = ArbiterAgent(AgentConfig(name="arbiter", llm=self.llm))
         aggregator = Aggregator(arbiter)
@@ -333,14 +343,15 @@ class ReviewPipeline:
         all_policy_criteria = policy_from_memory + policy_criteria
 
         logger.info(
-            "Aggregating with %d theme outputs, %d policy criteria (memory=%d, mined=%d)",
+            "Aggregating with %d theme outputs, %d policy criteria (memory=%d, mined=%d), %d similar cases",
             len(theme_outputs),
             len(all_policy_criteria),
             len(policy_from_memory),
             len(policy_criteria),
+            len(similar_cases) if similar_cases else 0,
         )
 
-        return aggregator.aggregate(theme_outputs, all_policy_criteria, venue_policy)
+        return aggregator.aggregate(theme_outputs, all_policy_criteria, venue_policy, similar_cases)
 
     def _verify_decision(
         self,
@@ -444,6 +455,7 @@ class ReviewPipeline:
         # Parallel execution of theme agents
         outputs: list[ThemeOutput] = []
         max_workers = min(len(themes), 6)
+        logger.info("Running theme agents for %d themes with max_workers=%d", len(themes), max_workers)
 
         def review_theme(theme: str) -> ThemeOutput:
             themed = [c for c in criteria if c.theme == theme]
@@ -548,6 +560,45 @@ class ReviewPipeline:
         bundle,
     ) -> str:
         """构建修订提示"""
+        import statistics
+
+        # Build anchor rating section from similar cases
+        anchor_section = ""
+        similar_cases = bundle.similar_paper_cases
+        if similar_cases:
+            valid_cases = [c for c in similar_cases if c.rating is not None]
+            if valid_cases:
+                ratings = [c.rating for c in valid_cases]
+                mean_rating = statistics.mean(ratings)
+                accept_count = sum(1 for c in valid_cases if c.decision and "accept" in c.decision.lower())
+                reject_count = sum(1 for c in valid_cases if c.decision and "reject" in c.decision.lower())
+
+                # Calculate suggested range
+                if accept_count > reject_count:
+                    suggested_range = f"{max(4.0, mean_rating - 1.0):.1f} - {min(10.0, mean_rating + 1.0):.1f}"
+                    suggested_decision = "Accept or Borderline"
+                elif reject_count > accept_count:
+                    suggested_range = f"{max(1.0, mean_rating - 1.5):.1f} - {min(6.0, mean_rating + 1.0):.1f}"
+                    suggested_decision = "Reject or Borderline"
+                else:
+                    suggested_range = f"{max(2.0, mean_rating - 1.0):.1f} - {min(8.0, mean_rating + 1.0):.1f}"
+                    suggested_decision = "Borderline"
+
+                anchor_section = "\n".join([
+                    "",
+                    "═══════════════════════════════════════════════════════════════",
+                    "⚠️ RATING CALIBRATION (CRITICAL FOR REVISION)",
+                    "",
+                    f"Anchor Rating: {mean_rating:.1f} (mean of {len(valid_cases)} similar papers)",
+                    f"Decision Distribution: Accept={accept_count}, Reject={reject_count}",
+                    "",
+                    f"Your revised rating should be within: {suggested_range}",
+                    f"Suggested decision: {suggested_decision}",
+                    "",
+                    "⚠️ DO NOT deviate more than ±1.5 from the anchor rating!",
+                    "═══════════════════════════════════════════════════════════════",
+                ])
+
         return "\n".join([
             "The initial review decision has failed verification. Please revise based on the following issues:",
             "",
@@ -564,9 +615,10 @@ class ReviewPipeline:
             "",
             f"Score-Text Alignment: {verification.score_text_alignment}",
             f"Evidence Support: {verification.evidence_support_level}",
+            anchor_section,
             "",
             "Please revise and return JSON with:",
-            "- raw_rating (float): revised rating",
+            "- raw_rating (float): revised rating (must respect anchor rating bounds)",
             "- decision_recommendation (string): accept/reject/borderline",
             "- revised_strengths (list, optional): updated strengths",
             "- revised_weaknesses (list, optional): updated weaknesses",

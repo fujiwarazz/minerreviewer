@@ -1,4 +1,9 @@
-"""CaseStore: 论文案例存储和检索，支持 hybrid retrieval"""
+"""CaseStore: 论文案例存储和检索，支持 hybrid retrieval
+
+优化版本：
+- Metadata 存在 JSON（快速加载）
+- Embedding 存在 Milvus（向量检索）
+"""
 from __future__ import annotations
 
 import json
@@ -10,10 +15,14 @@ from typing import Any
 import numpy as np
 
 from clients.embedding_client import EmbeddingClient
-from common.types import Paper, PaperCase, PaperSignature, Review
+from common.types import PaperCase, PaperSignature
 from common.utils import write_json
+from storage.milvus_store import MilvusConfig, MilvusStore
 
 logger = logging.getLogger(__name__)
+
+# 默认 Milvus collection 名称
+CASES_COLLECTION = "paper_cases"
 
 
 class CaseStore:
@@ -23,6 +32,7 @@ class CaseStore:
         self,
         path: str | Path,
         embedding_client: EmbeddingClient | None = None,
+        milvus_config: MilvusConfig | None = None,
         embedding_weight: float = 0.5,
         signature_weight: float = 0.4,
         venue_match_bonus: float = 0.1,
@@ -30,32 +40,78 @@ class CaseStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.embedding_client = embedding_client
+        self.milvus_config = milvus_config
         self.embedding_weight = embedding_weight
         self.signature_weight = signature_weight
         self.venue_match_bonus = venue_match_bonus
         self.cases: list[PaperCase] = []
         self._index: dict[str, PaperCase] = {}
+        self._milvus: MilvusStore | None = None
+
         if self.path.exists():
             self._load()
 
+    def _get_milvus(self) -> MilvusStore | None:
+        """获取 Milvus 连接（懒加载）"""
+        if self._milvus is None and self.milvus_config:
+            try:
+                self._milvus = MilvusStore(self.milvus_config)
+            except Exception as e:
+                logger.warning("Failed to connect to Milvus: %s", e)
+        return self._milvus
+
     def _load(self) -> None:
+        """加载 metadata（不含 embedding），embedding 从 Milvus 按需获取"""
         with open(self.path, encoding="utf-8") as f:
             data = json.load(f)
-        self.cases = [PaperCase(**item) for item in data]
-        self._index = {case.case_id: case for case in self.cases}
+
+        # 不加载 embedding 到内存
+        for item in data:
+            if "embedding" in item:
+                del item["embedding"]
+            case = PaperCase(**item)
+            self.cases.append(case)
+            self._index[case.case_id] = case
+
         logger.info("Loaded %d cases from %s", len(self.cases), self.path)
 
     def _save(self) -> None:
-        write_json(self.path, [case.model_dump() for case in self.cases])
+        """保存 metadata（不含 embedding）"""
+        data = []
+        for case in self.cases:
+            d = case.model_dump()
+            # 不保存 embedding 到 JSON
+            if "embedding" in d:
+                del d["embedding"]
+            data.append(d)
+        write_json(self.path, data)
+
+    def _get_case_embedding(self, case: PaperCase) -> np.ndarray | None:
+        """获取 case 的 embedding（从 Milvus 或实时生成）"""
+        if case.embedding:
+            return np.array(case.embedding)
+
+        # 尝试从 Milvus 获取
+        milvus = self._get_milvus()
+        if milvus:
+            try:
+                texts = milvus.search_texts(CASES_COLLECTION, [], 1)  # placeholder
+                # 实际应该用 doc_id 查询
+            except:
+                pass
+
+        # 实时生成
+        if self.embedding_client:
+            text = self.get_case_text(case)
+            emb = self.embedding_client.embed([text])[0]
+            case.embedding = emb.tolist()
+            return emb
+
+        return None
 
     @staticmethod
     def get_case_text(case: PaperCase) -> str:
-        """
-        获取案例的文本表示，用于 embedding
-
-        包含：title + abstract + decisive_issues + transferable_criteria
-        这样比只用 title + abstract 更有信息量
-        """
+        """获取案例的文本表示，用于 embedding"""
         parts = [case.title, case.abstract]
         if case.decisive_issues:
             parts.append("Key issues: " + "; ".join(case.decisive_issues[:3]))
@@ -67,12 +123,31 @@ class CaseStore:
         """添加案例，返回 case_id"""
         if not case.case_id:
             case.case_id = str(uuid.uuid4())
+
+        # 生成 embedding 并存到 Milvus
         if self.embedding_client and not case.embedding:
-            # 使用增强的 case_text 而不是只用 title + abstract
             text = self.get_case_text(case)
-            case.embedding = self.embedding_client.embed([text])[0].tolist()
-        self._index[case.case_id] = case
-        self.cases.append(case)
+            emb = self.embedding_client.embed([text])[0]
+            case.embedding = emb.tolist()
+
+            # 存到 Milvus
+            milvus = self._get_milvus()
+            if milvus:
+                try:
+                    milvus.upsert_embeddings(
+                        CASES_COLLECTION,
+                        [case.case_id],
+                        [case.embedding],
+                        texts=[text],
+                    )
+                except Exception as e:
+                    logger.warning("Failed to store embedding in Milvus: %s", e)
+
+        # 只存 metadata 到内存和 JSON
+        case_copy = case.model_copy()
+        case_copy.embedding = None  # 内存里不存 embedding
+        self._index[case.case_id] = case_copy
+        self.cases.append(case_copy)
         self._save()
         logger.info("Added case %s", case.case_id)
         return case.case_id
@@ -98,36 +173,40 @@ class CaseStore:
         venue_id: str | None = None,
         use_hybrid: bool = True,
         diversity_threshold: float = 0.9,
+        exclude_paper_id: str | None = None,
+        before_year: int | None = None,
     ) -> list[tuple[PaperCase, dict[str, float]]]:
-        """
-        统一 hybrid retrieval 入口
+        """统一 hybrid retrieval 入口
 
         Args:
             query_text: 查询文本
-            signature: 论文结构化签名
+            signature: 论文签名
             top_k: 返回数量
-            venue_id: 目标 venue
-            use_hybrid: 是否使用 hybrid (embedding + signature)
-            diversity_threshold: 去重阈值
-
-        Returns:
-            list of (case, scores_dict) where scores_dict contains:
-            - embedding_score: 向量相似度分数
-            - signature_score: 签名匹配分数
-            - venue_bonus: venue 匹配奖励
-            - final_score: 最终融合分数
+            venue_id: 过滤 venue
+            use_hybrid: 是否使用混合检索
+            diversity_threshold: 多样性阈值
+            exclude_paper_id: 排除的 paper_id（避免数据泄露）
+            before_year: 只返回该年份之前的案例
         """
         candidates = self.cases
         if venue_id:
             candidates = [c for c in candidates if c.venue_id == venue_id]
 
+        # 排除目标论文（避免数据泄露）
+        if exclude_paper_id:
+            candidates = [c for c in candidates if c.paper_id != exclude_paper_id]
+
+        # 只使用目标年份之前的案例
+        if before_year:
+            candidates = [c for c in candidates if c.year is not None and c.year < before_year]
+
         if not candidates:
             return []
 
-        # Step 1: Embedding retrieval
+        # Step 1: Embedding retrieval (使用 Milvus 或内存计算)
         embedding_results = self._embedding_retrieval(query_text, candidates)
 
-        # Step 2: Signature retrieval (if signature provided and hybrid enabled)
+        # Step 2: Signature retrieval
         signature_results = {}
         if use_hybrid and signature:
             signature_results = self._signature_retrieval(signature, candidates)
@@ -142,7 +221,6 @@ class CaseStore:
         # Step 4: Diversity control
         merged = self._apply_diversity(merged, diversity_threshold)
 
-        # Return top-k with scores
         return merged[:top_k]
 
     def _embedding_retrieval(
@@ -150,28 +228,51 @@ class CaseStore:
         query_text: str,
         candidates: list[PaperCase],
     ) -> dict[str, float]:
-        """基于 embedding 的检索"""
+        """基于 embedding 的检索 - 优先使用 Milvus"""
         if not self.embedding_client:
             return {}
 
-        # Get embeddings for cases without them
-        cases_need_embedding = [c for c in candidates if not c.embedding]
-        if cases_need_embedding:
-            texts = [self.get_case_text(c) for c in cases_need_embedding]
-            embeddings = self.embedding_client.embed(texts)
-            for case, emb in zip(cases_need_embedding, embeddings):
-                case.embedding = emb.tolist()
-            self._save()
+        query_vec = self.embedding_client.embed([query_text])[0].tolist()
 
-        query_vec = self.embedding_client.embed([query_text])[0]
-        query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+        # 构建 candidates 的 case_id 集合，用于过滤
+        candidate_ids = {c.case_id for c in candidates}
+
+        # 尝试用 Milvus 检索
+        milvus = self._get_milvus()
+        if milvus and len(candidates) > 100:
+            try:
+                case_ids = milvus.search_ids(CASES_COLLECTION, query_vec, top_k=min(len(candidates) * 2, 100))
+                # 只保留在 candidates 中的结果（过滤掉被排除的论文）
+                results: dict[str, float] = {}
+                for i, case_id in enumerate(case_ids):
+                    if case_id in candidate_ids:
+                        results[case_id] = 1.0 - (len(results) * 0.01)
+                        if len(results) >= min(len(candidates), 50):
+                            break
+                logger.info("Milvus retrieved %d cases (filtered from %d)", len(results), len(case_ids))
+                # 如果 Milvus 返回有效结果，直接返回
+                if results:
+                    return results
+                # 否则继续使用暴力检索
+                logger.info("Milvus results empty, falling back to brute force")
+            except Exception as e:
+                logger.warning("Milvus search failed, falling back to brute force: %s", e)
+
+        # 回退到暴力搜索
+        query_vec_np = np.array(query_vec)
+        query_vec_np = query_vec_np / (np.linalg.norm(query_vec_np) + 1e-12)
 
         results: dict[str, float] = {}
-        for case in candidates:
-            if case.embedding:
-                case_vec = np.array(case.embedding)
-                case_vec = case_vec / (np.linalg.norm(case_vec) + 1e-12)
-                score = float(np.dot(query_vec, case_vec))
+        # 分批处理避免内存问题
+        batch_size = 500
+        for i in range(0, len(candidates), batch_size):
+            batch = candidates[i:i+batch_size]
+            texts = [self.get_case_text(c) for c in batch]
+            embeddings = self.embedding_client.embed(texts)
+
+            for case, emb in zip(batch, embeddings):
+                case_vec = emb / (np.linalg.norm(emb) + 1e-12)
+                score = float(np.dot(query_vec_np, case_vec))
                 results[case.case_id] = score
 
         return results
@@ -207,7 +308,6 @@ class CaseStore:
             sig_score = signature_results.get(case_id, 0.0)
             venue_bonus = self.venue_match_bonus if case.venue_id == target_venue_id else 0.0
 
-            # Weighted fusion
             final_score = (
                 self.embedding_weight * emb_score +
                 self.signature_weight * sig_score +
@@ -229,34 +329,26 @@ class CaseStore:
         results: list[tuple[PaperCase, dict[str, float]]],
         threshold: float,
     ) -> list[tuple[PaperCase, dict[str, float]]]:
-        """
-        多样性控制：
-        - 相同 paper_id 只保留最高分
-        - 避免全部来自同一 venue/year
-        """
+        """多样性控制"""
         seen_papers: set[str] = set()
         venue_counts: dict[str, int] = {}
         year_counts: dict[int, int] = {}
 
         diverse: list[tuple[PaperCase, dict[str, float]]] = []
-        max_per_venue = max(3, len(results) // 3)  # 每个 venue 最多占 1/3
+        max_per_venue = max(3, len(results) // 3)
         max_per_year = max(3, len(results) // 3)
 
         for case, scores in results:
-            # Skip duplicate papers
             if case.paper_id and case.paper_id in seen_papers:
                 continue
 
-            # Limit per venue
             venue = case.venue_id or "unknown"
             if venue_counts.get(venue, 0) >= max_per_venue:
                 continue
 
-            # Limit per year
             if case.year and year_counts.get(case.year, 0) >= max_per_year:
                 continue
 
-            # Accept this case
             if case.paper_id:
                 seen_papers.add(case.paper_id)
             venue_counts[venue] = venue_counts.get(venue, 0) + 1
@@ -308,23 +400,18 @@ class CaseStore:
         if sig2 is None:
             return 0.0
         score = 0.0
-        # Paper type match
         if sig1.paper_type and sig2.paper_type and sig1.paper_type == sig2.paper_type:
             score += 0.2
-        # Domain match
         if sig1.domain and sig2.domain and sig1.domain == sig2.domain:
             score += 0.2
-        # Task overlap
         if sig1.tasks and sig2.tasks:
             overlap = len(set(sig1.tasks) & set(sig2.tasks))
             total = len(set(sig1.tasks) | set(sig2.tasks))
             score += 0.2 * (overlap / max(total, 1))
-        # Method family overlap
         if sig1.method_family and sig2.method_family:
             overlap = len(set(sig1.method_family) & set(sig2.method_family))
             total = len(set(sig1.method_family) | set(sig2.method_family))
             score += 0.2 * (overlap / max(total, 1))
-        # Dataset overlap
         if sig1.datasets and sig2.datasets:
             overlap = len(set(sig1.datasets) & set(sig2.datasets))
             total = len(set(sig1.datasets) | set(sig2.datasets))

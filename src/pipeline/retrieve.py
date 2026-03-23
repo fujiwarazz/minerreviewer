@@ -124,6 +124,8 @@ class Retriever:
                     top_k=min(top_k_papers, 5),
                     venue_id=self.venue_id,
                     use_hybrid=use_hybrid,
+                    exclude_paper_id=target_paper.paper_id,  # 避免数据泄露
+                    before_year=target_year,  # 只用目标年份之前的案例
                 )
                 similar_paper_cases = [case for case, _ in results]
                 case_scores = [

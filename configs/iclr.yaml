@@ -23,7 +23,7 @@ vector_store:
 embedding:
   backend: "vllm"
   model: "${EMBEDDING_MODEL:bge-embedding}"
-  vllm_base_url: "${EMBEDDING_BASE_URL:http://localhost:8001/v1}"
+  vllm_base_url: "${EMBEDDING_BASE_URL:http://10.20.49.150:8001/v1}"
 
 distill:
   max_total: 12

@@ -25,6 +25,39 @@ from eval.coverage import evaluate_coverage
 logger = logging.getLogger(__name__)
 
 
+def _truncate_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars]
+
+
+def _store_coverage_gaps(pipeline: ReviewPipeline, target: Paper, coverage_eval: dict, coverage_cfg: dict) -> None:
+    if not coverage_cfg.get("store_gaps", False):
+        return
+    vector_store = pipeline.config.get("vector_store", {})
+    if vector_store.get("backend") != "milvus":
+        return
+    gaps: list[str] = []
+    for aspect in ("strengths", "weaknesses"):
+        aspect_eval = coverage_eval.get(aspect, {})
+        gaps.extend(aspect_eval.get("unmatched_points", []) or [])
+    if not gaps:
+        return
+    context_prefix = f"{target.title}\n{target.abstract}"
+    contexts = [f"{context_prefix}\n{gap}" for gap in gaps]
+    embeddings = pipeline.embedding_client.embed(contexts)
+    collection = vector_store.get("coverage_gaps_collection", "coverage_gaps_iclr")
+    milvus_cfg = MilvusConfig(
+        host=vector_store.get("host", "localhost"),
+        port=int(vector_store.get("port", 19530)),
+        papers_collection=vector_store.get("papers_collection", "papers_iclr"),
+        reviews_collection=vector_store.get("reviews_collection", "reviews_iclr"),
+    )
+    milvus = MilvusStore(milvus_cfg)
+    ids = [str(uuid.uuid4()) for _ in gaps]
+    milvus.upsert_embeddings(collection, ids, embeddings.tolist(), texts=gaps)
+
+
 def build_index(
     venue_id: str,
     embedding_backend: str,
@@ -227,36 +260,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-def _truncate_text(text: str, max_chars: int) -> str:
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    return text[:max_chars]
-
-
-def _store_coverage_gaps(pipeline: ReviewPipeline, target: Paper, coverage_eval: dict, coverage_cfg: dict) -> None:
-    if not coverage_cfg.get("store_gaps", False):
-        return
-    vector_store = pipeline.config.get("vector_store", {})
-    if vector_store.get("backend") != "milvus":
-        return
-    gaps: list[str] = []
-    for aspect in ("strengths", "weaknesses"):
-        aspect_eval = coverage_eval.get(aspect, {})
-        gaps.extend(aspect_eval.get("unmatched_points", []) or [])
-    if not gaps:
-        return
-    context_prefix = f"{target.title}\n{target.abstract}"
-    contexts = [f"{context_prefix}\n{gap}" for gap in gaps]
-    embeddings = pipeline.embedding_client.embed(contexts)
-    collection = vector_store.get("coverage_gaps_collection", "coverage_gaps_iclr")
-    milvus_cfg = MilvusConfig(
-        host=vector_store.get("host", "localhost"),
-        port=int(vector_store.get("port", 19530)),
-        papers_collection=vector_store.get("papers_collection", "papers_iclr"),
-        reviews_collection=vector_store.get("reviews_collection", "reviews_iclr"),
-    )
-    milvus = MilvusStore(milvus_cfg)
-    ids = [str(uuid.uuid4()) for _ in gaps]
-    milvus.upsert_embeddings(collection, ids, embeddings.tolist(), texts=gaps)
