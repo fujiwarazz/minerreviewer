@@ -488,9 +488,9 @@ class TestCaseMemoryAffectsActivatedCriteria:
         # 验证 policy card 被转换为 activated criterion
         assert len(activated) > 0, "Policy cards should create activated criteria"
 
-        # 检查是否有来自 memory 的 criterion
-        memory_criteria = [c for c in activated if c.source == "memory"]
-        assert len(memory_criteria) > 0, "Should have criteria from memory"
+        # 检查是否有来自 policy_memory 的 criterion
+        policy_memory_criteria = [c for c in activated if c.source == "policy_memory"]
+        assert len(policy_memory_criteria) > 0, "Should have criteria from policy_memory"
 
         # 检查主题和内容是否正确传递
         novelty_criteria = [c for c in activated if c.theme == "novelty"]
@@ -702,3 +702,270 @@ class TestConsistencyCheckerPrefersCases:
         assert report.similar_review_count == 5
         if report.mean_rating is not None:
             assert abs(report.mean_rating - 7.0) < 0.1
+
+
+class TestPolicyCardsAffectAggregation:
+    """
+    回归测试：确保 policy_cards 真正进入 aggregation
+
+    验证：
+    - 有 policy_cards 时，arbiter 输入真的变了
+    - 没 policy_cards 时，结果不同
+    - policy 不再是"检索到了但没用"
+    """
+
+    def test_policy_cards_in_activated_criteria_source(self):
+        """policy_cards 应该标记为 policy_memory 来源"""
+        from pipeline.plan_criteria import CriteriaPlanner
+
+        class MockLLM:
+            pass
+
+        planner = CriteriaPlanner(MockLLM())
+        paper = Paper(paper_id="test", title="T", abstract="A", venue_id="ICLR")
+
+        policy_card = ExperienceCard(
+            card_id="policy-1",
+            kind="policy",
+            venue_id="ICLR",
+            theme="quality",
+            content="The paper should have clear baselines",
+            utility=0.9,
+        )
+
+        bundle = RetrievalBundle(target_paper=paper, policy_cards=[policy_card])
+        activated = planner.plan(signature=None, bundle=bundle, mined_criteria=[])
+
+        # 验证来源标记正确
+        policy_memory_criteria = [
+            c for c in activated
+            if c.source == "policy_memory"
+        ]
+        assert len(policy_memory_criteria) > 0, \
+            "Policy cards should be marked as 'policy_memory' source"
+
+    def test_with_and_without_policy_cards_produces_different_results(self):
+        """有/无 policy_cards 应该产生不同的 activated criteria"""
+        from pipeline.plan_criteria import CriteriaPlanner
+
+        class MockLLM:
+            pass
+
+        planner = CriteriaPlanner(MockLLM())
+        paper = Paper(paper_id="test", title="T", abstract="A", venue_id="ICLR")
+
+        # Scenario 1: without policy_cards
+        bundle_without = RetrievalBundle(target_paper=paper, policy_cards=[])
+        activated_without = planner.plan(
+            signature=None, bundle=bundle_without, mined_criteria=[]
+        )
+
+        # Scenario 2: with policy_cards
+        policy_card = ExperienceCard(
+            card_id="policy-1",
+            kind="policy",
+            venue_id="ICLR",
+            theme="novelty",
+            content="Novelty requirement from venue policy",
+            utility=0.8,
+        )
+        bundle_with = RetrievalBundle(target_paper=paper, policy_cards=[policy_card])
+        activated_with = planner.plan(
+            signature=None, bundle=bundle_with, mined_criteria=[]
+        )
+
+        # 验证结果不同
+        assert len(activated_with) > len(activated_without), \
+            "With policy_cards should have more activated criteria"
+
+        # 验证 policy memory 来源的 criterion 存在
+        policy_criteria = [c for c in activated_with if c.source == "policy_memory"]
+        assert len(policy_criteria) > 0, \
+            "Should have criteria from policy_memory when policy_cards are present"
+
+    def test_mined_policy_criteria_distinguished_from_memory(self):
+        """mined policy criteria 应该与 memory policy 区分"""
+        from pipeline.plan_criteria import CriteriaPlanner
+        from common.types import Criterion
+
+        class MockLLM:
+            pass
+
+        planner = CriteriaPlanner(MockLLM())
+        paper = Paper(paper_id="test", title="T", abstract="A", venue_id="ICLR")
+
+        # Memory policy card
+        policy_card = ExperienceCard(
+            card_id="policy-1",
+            kind="policy",
+            venue_id="ICLR",
+            theme="quality",
+            content="Memory policy criterion",
+            utility=0.7,
+        )
+
+        # Mined policy criterion
+        mined_policy = Criterion(
+            criterion_id="mined-1",
+            text="Mined policy criterion",
+            theme="quality",
+            kind="policy",
+        )
+
+        bundle = RetrievalBundle(target_paper=paper, policy_cards=[policy_card])
+        activated = planner.plan(
+            signature=None,
+            bundle=bundle,
+            mined_criteria=[],
+            mined_policy_criteria=[mined_policy],
+        )
+
+        # 验证两种来源都被激活
+        memory_criteria = [c for c in activated if c.source == "policy_memory"]
+        mined_criteria = [c for c in activated if c.source == "policy_mined"]
+
+        assert len(memory_criteria) > 0, "Should have policy_memory criteria"
+        assert len(mined_criteria) > 0, "Should have policy_mined criteria"
+
+
+class TestCaseRetrievalChangesActivatedCriteria:
+    """
+    回归测试：确保 case retrieval 改变 activated criteria
+
+    验证：
+    - 开启 case memory 后，activated criteria 与关闭时不同
+    - 至少有一部分 criteria 来自相似 case / policy memory
+    """
+
+    def test_case_memory_adds_criteria(self):
+        """有 case memory 时应该添加更多 criteria"""
+        from pipeline.plan_criteria import CriteriaPlanner
+
+        class MockLLM:
+            pass
+
+        planner = CriteriaPlanner(MockLLM())
+        paper = Paper(paper_id="test", title="T", abstract="A", venue_id="ICLR")
+
+        # Scenario 1: without cases
+        bundle_without = RetrievalBundle(
+            target_paper=paper,
+            similar_paper_cases=[],
+            policy_cards=[],
+        )
+        activated_without = planner.plan(
+            signature=None, bundle=bundle_without, mined_criteria=[]
+        )
+
+        # Scenario 2: with similar case
+        case = PaperCase(
+            case_id="case-1",
+            title="Similar Paper",
+            abstract="Similar abstract",
+            decision="reject",
+            transferable_criteria=[
+                "Should compare against SOTA baselines",
+                "Missing ablation study",
+            ],
+        )
+        bundle_with = RetrievalBundle(
+            target_paper=paper,
+            similar_paper_cases=[case],
+            policy_cards=[],
+        )
+        activated_with = planner.plan(
+            signature=None, bundle=bundle_with, mined_criteria=[]
+        )
+
+        # 验证数量增加
+        assert len(activated_with) >= len(activated_without), \
+            "Case memory should add more criteria"
+
+        # 验证有来自 case 的 criteria
+        case_criteria = [c for c in activated_with if "case" in c.source.lower()]
+        assert len(case_criteria) > 0, \
+            "Should have criteria from case memory"
+
+    def test_case_memory_criteria_have_correct_trigger_reason(self):
+        """case memory criteria 应该有正确的触发原因"""
+        from pipeline.plan_criteria import CriteriaPlanner
+
+        class MockLLM:
+            pass
+
+        planner = CriteriaPlanner(MockLLM())
+        paper = Paper(paper_id="test", title="T", abstract="A", venue_id="ICLR")
+
+        case = PaperCase(
+            case_id="case-123",
+            title="Rejected Paper",
+            abstract="Similar",
+            decision="reject",
+            transferable_criteria=["Critical issue identified"],
+        )
+        bundle = RetrievalBundle(target_paper=paper, similar_paper_cases=[case])
+        activated = planner.plan(signature=None, bundle=bundle, mined_criteria=[])
+
+        # 验证 trigger_reason 包含 case 信息
+        case_criteria = [c for c in activated if c.source == "case_memory"]
+        if case_criteria:
+            assert "case" in case_criteria[0].trigger_reason.lower(), \
+                "Case criteria should mention case in trigger_reason"
+            assert "reject" in case_criteria[0].trigger_reason.lower() or \
+                   "case-123" in case_criteria[0].trigger_reason.lower(), \
+                "Case criteria should mention decision or case_id"
+
+
+class TestScoreConsistencyCheckerNeverOverridesDecision:
+    """
+    回归测试：确保 consistency checker 不改变决策
+
+    这重复了之前的测试，但更明确地测试决策不变
+    """
+
+    def test_consistency_checker_does_not_change_decision(self):
+        """一致性检查不应改变决策推荐"""
+        from pipeline.check_score_consistency import ScoreConsistencyChecker
+        from common.types import Review
+
+        checker = ScoreConsistencyChecker(prefer_cases=True)
+        original_decision = "reject"
+        original_rating = 3.0
+
+        arbiter_output = ArbiterOutput(
+            strengths=["Minor contribution"],
+            weaknesses=["Major methodological issues", "Poor evaluation"],
+            raw_rating=original_rating,
+            decision_recommendation=original_decision,
+        )
+
+        paper = Paper(paper_id="test", title="T", abstract="A", venue_id="ICLR")
+
+        # 创建高评分的相似案例（与当前决策相反）
+        cases = [
+            PaperCase(
+                case_id=f"c{i}",
+                title=f"T{i}",
+                abstract="A",
+                rating=8.0,
+                decision="accept",
+            )
+            for i in range(5)
+        ]
+
+        bundle = RetrievalBundle(
+            target_paper=paper,
+            similar_paper_cases=cases,
+        )
+
+        report = checker.check(arbiter_output, bundle)
+
+        # 关键断言：决策不变
+        assert arbiter_output.decision_recommendation == original_decision, \
+            f"Decision should remain '{original_decision}', not be changed"
+        assert arbiter_output.raw_rating == original_rating, \
+            f"Rating should remain {original_rating}, not be changed"
+
+        # 应该有警告说明不一致
+        assert report.warning is not None or report.consistency_level == "low", \
+            "Should warn about inconsistency but not change decision"

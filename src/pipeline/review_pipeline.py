@@ -37,6 +37,7 @@ from pipeline.verify_decision import DecisionVerifier
 from storage.case_store import CaseStore
 from storage.doc_store import DocStore
 from storage.memory_store import MemoryStore
+from storage.milvus_store import MilvusConfig
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,12 @@ class ReviewPipeline:
         self.case_store = CaseStore(
             memory_cfg.get("case_store_path", "data/processed/cases.jsonl"),
             embedding_client=self.embedding_client,
+            milvus_config=MilvusConfig(
+                host=self.config.get("vector_store", {}).get("host", "localhost"),
+                port=int(self.config.get("vector_store", {}).get("port", 19530)),
+                papers_collection="",
+                reviews_collection="",
+            ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
         )
 
     def _init_components(self) -> None:
@@ -104,7 +111,7 @@ class ReviewPipeline:
         content_criteria, policy_criteria = self._mine_criteria(target, bundle, target_year)
 
         # 4. Plan criteria with memory
-        activated = self._plan_criteria(signature, bundle, content_criteria)
+        activated = self._plan_criteria(signature, bundle, content_criteria, policy_criteria)
 
         # 5. Rewrite criteria
         criteria = self._rewrite_criteria(target, activated)
@@ -112,8 +119,11 @@ class ReviewPipeline:
         # 6. Run theme agents
         theme_outputs = self._run_theme_agents(target, criteria)
 
-        # 7. Aggregate with arbiter
-        arbiter_output = self._aggregate(theme_outputs, bundle.policy_cards)
+        # 7. Aggregate with arbiter (now includes policy_criteria and venue_policy)
+        arbiter_output = self._aggregate(
+            theme_outputs, bundle.policy_cards, policy_criteria, bundle.venue_policy,
+            similar_cases=bundle.similar_paper_cases,
+        )
 
         # 8. Verify decision
         verification = self._verify_decision(arbiter_output, target, bundle)
@@ -141,8 +151,39 @@ class ReviewPipeline:
         # 14. Update memory
         memory_updates = self._update_memory(experience)
 
-        # 15. Build final report
+        # 15. Build final report with interpretability fields
         arbiter_output.raw_decision = arbiter_output.decision_recommendation
+
+        # Fill in interpretability summaries
+        if consistency.warning:
+            arbiter_output.consistency_summary = (
+                f"Consistency level: {consistency.consistency_level}. "
+                f"Based on {consistency.similar_review_count} similar cases. "
+                f"{consistency.warning}"
+            )
+        else:
+            arbiter_output.consistency_summary = (
+                f"Consistency level: {consistency.consistency_level}. "
+                f"Based on {consistency.similar_review_count} similar cases."
+            )
+
+        # Extract key decisive issues from weaknesses if not set
+        if not arbiter_output.key_decisive_issues:
+            arbiter_output.key_decisive_issues = [
+                w[:100] + "..." if len(w) > 100 else w
+                for w in arbiter_output.weaknesses[:3]
+            ]
+
+        # Generate decision rationale if not set
+        if not arbiter_output.decision_rationale:
+            decision = arbiter_output.decision_recommendation or "borderline"
+            rating = arbiter_output.raw_rating
+            arbiter_output.decision_rationale = (
+                f"Decision: {decision} (rating: {rating:.1f}). "
+                f"Key factors: {len(arbiter_output.strengths)} strengths, "
+                f"{len(arbiter_output.weaknesses)} weaknesses identified."
+            )
+
         arbiter_output.trace.update({
             "paper_signature": signature.model_dump() if signature else {},
             "retrieval": bundle.trace,
@@ -252,6 +293,7 @@ class ReviewPipeline:
         signature: PaperSignature | None,
         bundle,
         content_criteria: list[Criterion],
+        policy_criteria: list[Criterion],
     ) -> list[ActivatedCriterion]:
         """规划激活的标准"""
         max_criteria = self.config.get("distill", {}).get("max_total", 15)
@@ -259,6 +301,7 @@ class ReviewPipeline:
             signature=signature,
             bundle=bundle,
             mined_criteria=content_criteria,
+            mined_policy_criteria=policy_criteria,
             max_criteria=max_criteria,
         )
 
@@ -268,13 +311,47 @@ class ReviewPipeline:
         rewriter = CriteriaRewriter(self.llm)
         return rewriter.rewrite(target, criteria)
 
-    def _aggregate(self, theme_outputs: list[ThemeOutput], policy_cards) -> ArbiterOutput:
-        """聚合主题输出"""
+    def _aggregate(
+        self,
+        theme_outputs: list[ThemeOutput],
+        policy_cards: list,
+        policy_criteria: list[Criterion],
+        venue_policy,
+        similar_cases: list[PaperCase] | None = None,
+    ) -> ArbiterOutput:
+        """
+        聚合主题输出
+
+        现在真正使用 policy_criteria 和 venue_policy 进入最终决策
+        同时参考相似案例的评分分布来校准打分
+        """
         arbiter = ArbiterAgent(AgentConfig(name="arbiter", llm=self.llm))
         aggregator = Aggregator(arbiter)
-        # Convert policy cards to criteria for compatibility
-        policy_criteria = []
-        return aggregator.aggregate(theme_outputs, policy_criteria, None)
+
+        # Convert policy cards to criteria format for arbiter
+        policy_from_memory = []
+        for card in policy_cards:
+            policy_from_memory.append(Criterion(
+                criterion_id=f"policy_memory_{card.card_id[:8]}",
+                text=card.content,
+                theme=card.theme,
+                kind="policy",
+                source_ids=[f"memory:{card.card_id}"],
+            ))
+
+        # Merge all policy criteria: memory + mined
+        all_policy_criteria = policy_from_memory + policy_criteria
+
+        logger.info(
+            "Aggregating with %d theme outputs, %d policy criteria (memory=%d, mined=%d), %d similar cases",
+            len(theme_outputs),
+            len(all_policy_criteria),
+            len(policy_from_memory),
+            len(policy_criteria),
+            len(similar_cases) if similar_cases else 0,
+        )
+
+        return aggregator.aggregate(theme_outputs, all_policy_criteria, venue_policy, similar_cases)
 
     def _verify_decision(
         self,
@@ -378,6 +455,7 @@ class ReviewPipeline:
         # Parallel execution of theme agents
         outputs: list[ThemeOutput] = []
         max_workers = min(len(themes), 6)
+        logger.info("Running theme agents for %d themes with max_workers=%d", len(themes), max_workers)
 
         def review_theme(theme: str) -> ThemeOutput:
             themed = [c for c in criteria if c.theme == theme]
@@ -447,12 +525,26 @@ class ReviewPipeline:
             if "revised_weaknesses" in response:
                 arbiter_output.weaknesses = response["revised_weaknesses"]
 
+            # 更新可解释性字段
+            if "decision_rationale" in response:
+                arbiter_output.decision_rationale = response["decision_rationale"]
+
+            if "key_decisive_issues" in response:
+                arbiter_output.key_decisive_issues = response["key_decisive_issues"]
+
             # Record revision in trace
             arbiter_output.trace["revision"] = {
                 "reason": verification.warnings,
                 "old_rating": arbiter_output.trace.get("initial_rating"),
                 "new_rating": arbiter_output.raw_rating,
+                "was_revised": True,
             }
+
+            # 更新验证摘要
+            arbiter_output.verification_summary = (
+                f"Revision triggered due to: {', '.join(verification.warnings[:2])}. "
+                f"Score-text alignment: {verification.score_text_alignment}."
+            )
 
         except Exception as e:
             logger.error("Failed to revise decision: %s", e)
@@ -468,6 +560,45 @@ class ReviewPipeline:
         bundle,
     ) -> str:
         """构建修订提示"""
+        import statistics
+
+        # Build anchor rating section from similar cases
+        anchor_section = ""
+        similar_cases = bundle.similar_paper_cases
+        if similar_cases:
+            valid_cases = [c for c in similar_cases if c.rating is not None]
+            if valid_cases:
+                ratings = [c.rating for c in valid_cases]
+                mean_rating = statistics.mean(ratings)
+                accept_count = sum(1 for c in valid_cases if c.decision and "accept" in c.decision.lower())
+                reject_count = sum(1 for c in valid_cases if c.decision and "reject" in c.decision.lower())
+
+                # Calculate suggested range
+                if accept_count > reject_count:
+                    suggested_range = f"{max(4.0, mean_rating - 1.0):.1f} - {min(10.0, mean_rating + 1.0):.1f}"
+                    suggested_decision = "Accept or Borderline"
+                elif reject_count > accept_count:
+                    suggested_range = f"{max(1.0, mean_rating - 1.5):.1f} - {min(6.0, mean_rating + 1.0):.1f}"
+                    suggested_decision = "Reject or Borderline"
+                else:
+                    suggested_range = f"{max(2.0, mean_rating - 1.0):.1f} - {min(8.0, mean_rating + 1.0):.1f}"
+                    suggested_decision = "Borderline"
+
+                anchor_section = "\n".join([
+                    "",
+                    "═══════════════════════════════════════════════════════════════",
+                    "⚠️ RATING CALIBRATION (CRITICAL FOR REVISION)",
+                    "",
+                    f"Anchor Rating: {mean_rating:.1f} (mean of {len(valid_cases)} similar papers)",
+                    f"Decision Distribution: Accept={accept_count}, Reject={reject_count}",
+                    "",
+                    f"Your revised rating should be within: {suggested_range}",
+                    f"Suggested decision: {suggested_decision}",
+                    "",
+                    "⚠️ DO NOT deviate more than ±1.5 from the anchor rating!",
+                    "═══════════════════════════════════════════════════════════════",
+                ])
+
         return "\n".join([
             "The initial review decision has failed verification. Please revise based on the following issues:",
             "",
@@ -484,12 +615,15 @@ class ReviewPipeline:
             "",
             f"Score-Text Alignment: {verification.score_text_alignment}",
             f"Evidence Support: {verification.evidence_support_level}",
+            anchor_section,
             "",
             "Please revise and return JSON with:",
-            "- raw_rating (float): revised rating",
+            "- raw_rating (float): revised rating (must respect anchor rating bounds)",
             "- decision_recommendation (string): accept/reject/borderline",
             "- revised_strengths (list, optional): updated strengths",
             "- revised_weaknesses (list, optional): updated weaknesses",
+            "- decision_rationale (string, optional): brief explanation of the decision",
+            "- key_decisive_issues (list, optional): the 1-3 most decisive issues that determined the outcome",
         ])
 
     def _apply_calibration(

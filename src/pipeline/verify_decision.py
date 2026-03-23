@@ -153,9 +153,9 @@ class DecisionVerifier:
         if not similar_cases:
             return "unknown"
 
-        # Count similar decisions
-        accept_count = sum(1 for c in similar_cases if c.decision == "accept")
-        reject_count = sum(1 for c in similar_cases if c.decision == "reject")
+        # Count similar decisions (case-insensitive)
+        accept_count = sum(1 for c in similar_cases if c.decision and "accept" in c.decision.lower())
+        reject_count = sum(1 for c in similar_cases if c.decision and "reject" in c.decision.lower())
 
         if "accept" in decision.lower() and accept_count > reject_count:
             return "high"

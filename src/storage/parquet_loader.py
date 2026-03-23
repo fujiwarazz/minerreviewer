@@ -92,17 +92,36 @@ def load_parquet_ground_truth(path: str | Path, row_index: int = 0) -> list[dict
                     continue
                 strengths = content.get("strengths")
                 weaknesses = content.get("weaknesses")
+
+                # Try content.rating first (ICLR format)
+                rating_info = content.get("rating")
                 rating_value = None
-                scores = entry.get("scores") if isinstance(entry.get("scores"), dict) else {}
-                if isinstance(scores, dict):
-                    rating_value = scores.get("rating", {}).get("value") if isinstance(scores.get("rating"), dict) else None
+                if isinstance(rating_info, dict):
+                    rating_value = rating_info.get("value")
+                elif rating_info:
+                    rating_value = rating_info
+
+                # Fallback to entry.scores
+                if not rating_value:
+                    scores = entry.get("scores") if isinstance(entry.get("scores"), dict) else {}
+                    if isinstance(scores, dict):
+                        rating_value = scores.get("rating", {}).get("value") if isinstance(scores.get("rating"), dict) else None
+
+                # Get confidence
+                confidence_info = content.get("confidence")
+                confidence_value = None
+                if isinstance(confidence_info, dict):
+                    confidence_value = confidence_info.get("value")
+                elif confidence_info:
+                    confidence_value = confidence_info
+
                 outputs.append(
                     {
                         "reply_id": entry.get("reply_id"),
                         "strengths": strengths,
                         "weaknesses": weaknesses,
                         "rating": rating_value,
-                        "confidence": scores.get("confidence", {}).get("value") if isinstance(scores.get("confidence"), dict) else None,
+                        "confidence": confidence_value,
                         "decision": decision,
                     }
                 )
