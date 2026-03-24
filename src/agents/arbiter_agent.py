@@ -131,36 +131,27 @@ class ArbiterAgent:
 - Apply similar reasoning to the target paper.
 """
 
-                # 构建评分锚点建议
-                if accept_count > reject_count:
-                    suggested_range = f"{max(4.0, mean_rating - 1.0):.1f} - {min(10.0, mean_rating + 1.0):.1f}"
-                    suggested_decision = "Accept or Borderline"
-                elif reject_count > accept_count:
-                    suggested_range = f"{max(1.0, mean_rating - 1.5):.1f} - {min(6.0, mean_rating + 1.0):.1f}"
-                    suggested_decision = "Reject or Borderline"
-                else:
-                    suggested_range = f"{max(2.0, mean_rating - 1.0):.1f} - {min(8.0, mean_rating + 1.0):.1f}"
-                    suggested_decision = "Borderline"
-
+                # 不预设阈值，让 Arbiter 自己从案例中学习
                 rating_reference = f"""
 ═══════════════════════════════════════════════════════════════
-⚠️ RATING GUIDANCE FROM SIMILAR CASES
+📊 RATING ANALYSIS FROM SIMILAR CASES
 
-**Anchor Rating: {mean_rating:.1f}** (mean of {len(valid_cases)} similar papers)
+**Statistics from {len(valid_cases)} similar papers:**
+- Mean Rating: {mean_rating:.1f}
+- Median Rating: {median_rating:.1f}
+- Range: {min_rating:.1f} - {max_rating:.1f}
+- Decision Distribution: {accept_count} Accept, {reject_count} Reject
 
-Based on the similar cases above:
-- Their ratings suggest this paper should be around **{mean_rating:.1f}**
-- Key patterns: {accept_count} Accept vs {reject_count} Reject
+**Your Task - Learn from these cases:**
+1. Analyze the rating patterns above - what rating thresholds separate Accept from Reject?
+2. Compare each case's strengths/weaknesses to its rating
+3. Identify what quality factors led to higher/lower ratings
+4. Apply the same reasoning to the target paper
 
-**Your rating should be within: {suggested_range}**
-
-Guidelines:
-1. Study the strengths/weaknesses of similar cases
-2. Compare the target paper's quality to those cases
-3. Rate accordingly - if comparable quality, rate near {mean_rating:.1f}
-4. Explain your reasoning by referencing specific similar cases
-
-**Suggested decision: {suggested_decision}** (based on similar cases' patterns)
+**Important:**
+- You should derive your own rating thresholds from the similar cases
+- Don't use preset thresholds - learn from the data
+- Explain your reasoning by referencing specific cases
 ═══════════════════════════════════════════════════════════════
 """
                 rating_anchor = f"[ANCHOR: {mean_rating:.1f}]"
