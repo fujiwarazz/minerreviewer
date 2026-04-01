@@ -118,23 +118,30 @@ class Retriever:
             try:
                 query_text = f"{target_paper.title}\n{target_paper.abstract}"
                 use_hybrid = self.vector_store.get("case_rerank_enabled", True)
+                # Retrieve more candidates for balancing
+                # Don't restrict to same venue - allow cross-venue retrieval for better rating anchors
                 results = self.case_store.retrieve_cases(
                     query_text=query_text,
                     signature=paper_signature,
-                    top_k=min(top_k_papers, 5),
-                    venue_id=self.venue_id,
+                    top_k=min(top_k_papers * 4, 20),  # Get more candidates
+                    venue_id=None,  # Allow all venues for better rating diversity
                     use_hybrid=use_hybrid,
                     exclude_paper_id=target_paper.paper_id,  # 避免数据泄露
                     before_year=target_year,  # 只用目标年份之前的案例
                 )
-                similar_paper_cases = [case for case, _ in results]
+                # Balance by decision
+                similar_paper_cases = self._balance_cases_by_decision(
+                    results, target_count=top_k_papers
+                )
                 case_scores = [
                     {"case_id": case.case_id, "scores": scores}
                     for case, scores in results
+                    if case in similar_paper_cases
                 ]
                 logger.info(
-                    "Retrieved %d similar paper cases (hybrid=%s)",
+                    "Retrieved %d similar paper cases (balanced from %d candidates, hybrid=%s)",
                     len(similar_paper_cases),
+                    len(results),
                     use_hybrid,
                 )
             except Exception as e:
@@ -241,3 +248,62 @@ class Retriever:
         norm_paper = paper_vec / (np.linalg.norm(paper_vec) + 1e-12)
         score = np.dot(norm_query, norm_paper.T).squeeze()
         return float(score)
+
+    def _balance_cases_by_decision(
+        self,
+        results: list[tuple[PaperCase, dict]],
+        target_count: int = 4,
+    ) -> list[PaperCase]:
+        """Balance retrieved cases by decision (Accept/Reject).
+
+        Ensures roughly equal representation of Accept and Reject cases
+        while preserving similarity ranking within each group.
+        """
+        if not results:
+            return []
+
+        # Separate by decision
+        accept_cases = []
+        reject_cases = []
+        other_cases = []
+
+        for case, scores in results:
+            if case.decision == "Accept":
+                accept_cases.append((case, scores))
+            elif case.decision == "Reject":
+                reject_cases.append((case, scores))
+            else:
+                other_cases.append((case, scores))
+
+        # Target: roughly equal Accept/Reject
+        half = target_count // 2
+        remainder = target_count % 2
+
+        # Take top from each category (already sorted by similarity)
+        selected_accept = [c for c, _ in accept_cases[:half + remainder]]
+        selected_reject = [c for c, _ in reject_cases[:half]]
+
+        # Interleave to preserve some ranking
+        balanced = []
+        for i in range(max(len(selected_accept), len(selected_reject))):
+            if i < len(selected_accept):
+                balanced.append(selected_accept[i])
+            if i < len(selected_reject):
+                balanced.append(selected_reject[i])
+
+        # Fill remaining slots with other cases if needed
+        if len(balanced) < target_count:
+            for case, _ in other_cases:
+                if len(balanced) >= target_count:
+                    break
+                balanced.append(case)
+
+        logger.info(
+            "Balanced cases: %d Accept, %d Reject from %d accept candidates, %d reject candidates",
+            len(selected_accept),
+            len(selected_reject),
+            len(accept_cases),
+            len(reject_cases),
+        )
+
+        return balanced[:target_count]

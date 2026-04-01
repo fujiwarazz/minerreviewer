@@ -30,10 +30,11 @@ class ThemeAgent:
         self.use_fulltext = use_fulltext
         self.max_fulltext_chars = max_fulltext_chars
 
-    def review(self, target: Paper, criteria: list[Criterion]) -> ThemeOutput:
-        if not criteria:
+    def review(self, target: Paper, criteria: list[Criterion], policy_cards: list = None) -> ThemeOutput:
+        if not criteria and not policy_cards:
             return ThemeOutput(theme=self.theme, strengths=[], weaknesses=[], severity_tags=[], criteria_used=[])
-        prompt = self._prompt(target, criteria)
+        policy_cards = policy_cards or []
+        prompt = self._prompt(target, criteria, policy_cards)
         response = self.config.llm.generate_json(prompt)
         strengths = response.get("strengths", [])
         weaknesses = response.get("weaknesses", [])
@@ -58,7 +59,7 @@ class ThemeAgent:
             criteria_used=[c.criterion_id for c in criteria],
         )
 
-    def _prompt(self, target: Paper, criteria: list[Criterion]) -> str:
+    def _prompt(self, target: Paper, criteria: list[Criterion], policy_cards: list = None) -> str:
         serialized = [c.model_dump() for c in criteria]
         fulltext = ""
         if self.use_fulltext and target.fulltext:
@@ -69,6 +70,22 @@ class ThemeAgent:
             f"{i+1}. [{c.theme}] {c.text}"
             for i, c in enumerate(criteria)
         ])
+
+        # Add policy cards section
+        policy_cards = policy_cards or []
+        policy_section = ""
+        if policy_cards:
+            policy_items = []
+            for card in policy_cards[:10]:  # 增加到 10 条
+                # Handle both dict and Pydantic model
+                if hasattr(card, 'content'):
+                    content = card.content or ""
+                else:
+                    content = card.get("content", "")
+                if content:
+                    policy_items.append(f"- {content[:150]}")
+            if policy_items:
+                policy_section = "\n## Review Standards (Policy Cards)\n" + "\n".join(policy_items) + "\n"
 
         return "\n".join([
             f"You are an expert reviewer focusing on the '{self.theme}' aspect of an ICLR paper submission.",
@@ -85,13 +102,37 @@ class ThemeAgent:
             "",
             REVIEW_EXAMPLES,
             "",
+            policy_section,
+            "## Critical Evaluation Guidelines",
+            "When identifying weaknesses, also consider these high-level questions:",
+            "",
+            "**Novelty & Originality:**",
+            "- Is this merely a straightforward extension or minor modification of existing methods?",
+            "- Does the paper introduce genuinely new concepts or just repackage existing ideas?",
+            "- Are the contributions incremental rather than substantial advances?",
+            "",
+            "**Practical Applicability:**",
+            "- Are there practical limitations that hinder real-world deployment?",
+            "- Is the proposed method computationally efficient enough for practical use?",
+            "- Does the approach require unrealistic assumptions or resources?",
+            "",
+            "**Experimental Rigor:**",
+            "- Are the experiments comprehensive enough to validate the claims?",
+            "- Is there sufficient comparison with strong baselines?",
+            "- Are there missing evaluation scenarios (e.g., edge cases, out-of-distribution)?",
+            "",
+            "**Theoretical Soundness:**",
+            "- Are the theoretical assumptions reasonable and well-justified?",
+            "- Do the theoretical results directly support the practical claims?",
+            "- Are there gaps between theory and implementation?",
+            "",
             "## Target Paper",
             f"Title: {target.title}",
             f"Abstract: {target.abstract}",
             fulltext,
             "",
             "## Criteria to Evaluate",
-            criteria_list,
+            criteria_list if criteria_list else "(No specific criteria for this theme - use general standards)",
             "",
             "## Output Requirements",
             "Return JSON with:",
@@ -103,7 +144,7 @@ class ThemeAgent:
             "  - 'minor': small issue that could be easily fixed",
             "- notes: optional additional comments or suggestions",
             "",
-            "Remember: Quality > Quantity. Each point should be substantive and well-evidenced.",
+            "Remember: Focus on HIGH-LEVEL issues (novelty, practicality, rigor) not just low-level details.",
         ])
 
     @staticmethod

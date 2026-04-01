@@ -63,7 +63,13 @@ class CaseStore:
     def _load(self) -> None:
         """加载 metadata（不含 embedding），embedding 从 Milvus 按需获取"""
         with open(self.path, encoding="utf-8") as f:
-            data = json.load(f)
+            content = f.read().strip()
+
+        # 支持 JSON 数组或 JSONL 格式
+        if content.startswith('['):
+            data = json.loads(content)
+        else:
+            data = [json.loads(line) for line in content.split('\n') if line.strip()]
 
         # 不加载 embedding 到内存
         for item in data:

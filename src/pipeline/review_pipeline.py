@@ -117,7 +117,7 @@ class ReviewPipeline:
         criteria = self._rewrite_criteria(target, activated)
 
         # 6. Run theme agents
-        theme_outputs = self._run_theme_agents(target, criteria)
+        theme_outputs = self._run_theme_agents(target, criteria, bundle.policy_cards)
 
         # 7. Aggregate with arbiter (now includes policy_criteria and venue_policy)
         arbiter_output = self._aggregate(
@@ -442,8 +442,17 @@ class ReviewPipeline:
 
         return updates
 
-    def _run_theme_agents(self, target: Paper, criteria: list[Criterion]) -> list[ThemeOutput]:
+    def _run_theme_agents(self, target: Paper, criteria: list[Criterion], policy_cards: list = None) -> list[ThemeOutput]:
+        # 核心 themes - 始终评估这些维度
+        core_themes = ["Clarity", "Quality", "Originality", "Significance", "Experiments"]
         themes = list(self.config.get("themes", []))
+
+        # 添加核心 themes
+        for t in core_themes:
+            if t not in themes:
+                themes.append(t)
+
+        # 添加 criteria 中的 themes
         criteria_themes = [c.theme for c in criteria if c.theme]
         for theme in criteria_themes:
             if theme not in themes:
@@ -452,6 +461,19 @@ class ReviewPipeline:
         use_fulltext = bool(review_cfg.get("use_fulltext", False))
         max_fulltext_chars = int(review_cfg.get("max_fulltext_chars", 12000))
 
+        # Filter policy cards by theme
+        policy_cards = policy_cards or []
+        themed_policies = {}
+        for card in policy_cards:
+            # Handle both dict and Pydantic model
+            if hasattr(card, 'theme'):
+                card_theme = card.theme.lower() if card.theme else "general"
+            else:
+                card_theme = card.get("theme", "general").lower()
+            if card_theme not in themed_policies:
+                themed_policies[card_theme] = []
+            themed_policies[card_theme].append(card)
+
         # Parallel execution of theme agents
         outputs: list[ThemeOutput] = []
         max_workers = min(len(themes), 6)
@@ -459,13 +481,14 @@ class ReviewPipeline:
 
         def review_theme(theme: str) -> ThemeOutput:
             themed = [c for c in criteria if c.theme == theme]
+            themed_pol = themed_policies.get(theme.lower(), [])[:10]  # 每个主题最多10条 policy
             agent = ThemeAgent(
                 AgentConfig(name=f"theme_{theme}", llm=self.llm),
                 theme,
                 use_fulltext=use_fulltext,
                 max_fulltext_chars=max_fulltext_chars,
             )
-            return agent.review(target, themed)
+            return agent.review(target, themed, themed_pol)
 
         if max_workers > 1 and len(themes) > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
