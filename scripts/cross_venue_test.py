@@ -302,6 +302,9 @@ def get_test_papers(n_accept=25, n_reject=25, seed=42):
     for f in files:
         result = parse_review_file(f)
         if result and result['decision']:
+            # 过滤掉没有 GT Weaknesses 的论文
+            if not result.get('gt_weaknesses'):
+                continue
             if result['decision'] == 'Accept':
                 accept_papers.append(result)
             elif result['decision'] == 'Reject':

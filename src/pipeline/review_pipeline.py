@@ -443,7 +443,16 @@ class ReviewPipeline:
         return updates
 
     def _run_theme_agents(self, target: Paper, criteria: list[Criterion], policy_cards: list = None) -> list[ThemeOutput]:
+        # 核心 themes - 始终评估这些维度
+        core_themes = ["Clarity", "Quality", "Originality", "Significance", "Experiments"]
         themes = list(self.config.get("themes", []))
+
+        # 添加核心 themes
+        for t in core_themes:
+            if t not in themes:
+                themes.append(t)
+
+        # 添加 criteria 中的 themes
         criteria_themes = [c.theme for c in criteria if c.theme]
         for theme in criteria_themes:
             if theme not in themes:

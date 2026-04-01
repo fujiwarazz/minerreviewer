@@ -35,20 +35,33 @@ python scripts/cross_venue_test.py --config configs/iclr.yaml --test_venue NeurI
 
 # Run tests
 PYTHONPATH=src pytest tests/ -v
+
+# Run a single test file
+PYTHONPATH=src pytest tests/test_memory_store.py -v
+
+# Run tests with coverage
+PYTHONPATH=src pytest tests/ -v --cov=src --cov-report=term-missing
 ```
 
 ## Architecture
 
 ```
 src/
-├── main.py              # CLI entry point
+├── main.py              # CLI entry point (peerreviewer command)
 ├── pipeline/            # Core review pipeline stages
 │   ├── review_pipeline.py   # Main orchestrator
+│   ├── parse_paper.py       # Extract PaperSignature from papers
 │   ├── retrieve.py          # Multi-channel retrieval (cases + papers + policies)
 │   ├── mine_criteria.py     # Extract criteria from historical data
 │   ├── plan_criteria.py     # Activate criteria from memory
+│   ├── distill_criteria.py  # Deduplicate and refine criteria
+│   ├── rewrite_criteria.py  # Format criteria for agents
 │   ├── aggregate.py         # Arbiter agent
-│   └── calibrate.py         # Rating calibration
+│   ├── verify_decision.py   # Check score-text alignment
+│   ├── check_score_consistency.py  # Consistency warnings (never modifies scores)
+│   ├── calibrate.py         # Rating calibration (isotonic regression)
+│   ├── distill_experience.py    # Extract reusable experience from traces
+│   └── memory_editor.py     # Manage short/long-term memory admission
 ├── agents/              # Multi-agent system
 │   ├── theme_agent.py       # Per-theme review generation
 │   └── arbiter_agent.py     # Final rating/decision synthesis with case learning
@@ -73,12 +86,31 @@ src/
 
 ## Review Pipeline Flow
 
-1. **Retrieve**: Multi-channel retrieval - find similar PaperCases (for rating calibration) + policy cards + supporting papers
-2. **Mine Criteria**: Extract content criteria from similar papers, policy criteria from accept/reject reviews
-3. **Theme Agents**: Each agent reviews one theme, outputs strengths/weaknesses
-4. **Arbiter**: Aggregates outputs, learns from similar cases' patterns, produces calibrated rating
-5. **Verify**: Check score-text alignment and decision consistency
-6. **Calibrate**: Apply isotonic regression for acceptance likelihood
+1. **ParsePaper**: Extract structured `PaperSignature` from paper (paper_type, tasks, domain, method_family)
+2. **Retrieve**: Multi-channel retrieval - find similar PaperCases + policy/critique/failure cards + supporting papers
+3. **Mine Criteria**: Extract content criteria from similar papers, policy criteria from accept/reject reviews
+4. **Plan Criteria**: Activate relevant criteria from memory based on paper signature
+5. **Distill/Rewrite Criteria**: Deduplicate and format criteria for theme agents
+6. **Theme Agents**: Each agent reviews one theme, outputs strengths/weaknesses with severity tags
+7. **Arbiter**: Aggregates outputs, learns from similar cases' patterns, produces rating with rationale
+8. **Verify**: Check score-text alignment, evidence support, venue alignment
+9. **ScoreConsistencyChecker**: Compare rating against similar cases, warn if deviating (never modifies scores)
+10. **Calibrate**: Apply isotonic regression for acceptance likelihood based on historical data
+11. **DistillExperience**: Extract reusable experience cards from review trace
+12. **MemoryEditor**: Decide admission to short-term vs long-term memory
+
+## Review Output Fields
+
+Each review produces an `ArbiterOutput` with:
+- `raw_rating`: Initial arbiter rating (1-10 scale)
+- `decision_recommendation`: Accept/Reject/Borderline
+- `acceptance_likelihood`: Calibrated probability from historical data
+- `key_decisive_issues`: Issues that determined the decision
+- `decision_rationale` / `score_rationale`: Explainability fields
+- `verification`: `DecisionVerificationReport` (score-text alignment, evidence support)
+- `consistency`: `ScoreConsistencyReport` (comparison with similar cases)
+- `calibration`: `CalibrationResult` (multi-way likelihood breakdown)
+- `trace`: Full audit trail for debugging
 
 ## Memory System
 
@@ -100,6 +132,11 @@ Config files use YAML with environment variable substitution (`configs/iclr.yaml
 ## Environment Variables
 
 Required for LLM/embedding services:
-- `OPENAI_API_KEY` or `DASHSCOPE_API_KEY`
+- `OPENAI_API_KEY` or `DASHSCOPE_API_KEY` (choose based on LLM backend)
+- `LLM_BACKEND`: "openai" or "dashscope"
+- `LLM_MODEL`: e.g., "qwen-plus"
+- `LLM_BASE_URL`: LLM endpoint URL
 - `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`
 - `MILVUS_HOST` (for vector store)
+
+Config files use `${VAR:default}` syntax for environment variable substitution. See `configs/iclr.example.yaml` for full template.
