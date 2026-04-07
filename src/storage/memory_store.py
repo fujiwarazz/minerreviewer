@@ -22,7 +22,17 @@ class MemoryStore:
             self._load()
 
     def _load(self) -> None:
-        data = read_json(self.path)
+        """加载卡片，支持 JSON 数组和 JSONL 格式"""
+        import json
+        with open(self.path, encoding="utf-8") as f:
+            content = f.read().strip()
+
+        # 支持 JSON 数组或 JSONL 格式
+        if content.startswith('['):
+            data = json.loads(content)
+        else:
+            data = [json.loads(line) for line in content.split('\n') if line.strip()]
+
         self.cards = [ExperienceCard(**item) for item in data]
 
     def _save(self) -> None:
