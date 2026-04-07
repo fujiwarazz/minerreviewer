@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from common.types import ExperienceCard, PaperCase
 from storage.case_store import CaseStore
 from storage.memory_store import MemoryStore
+from storage.multi_case_store import MultiCaseStore
+from storage.multi_memory_store import MultiMemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +23,8 @@ class MemoryEditor:
 
     def __init__(
         self,
-        memory_store: MemoryStore,
-        case_store: CaseStore | None = None,
+        memory_store: MemoryStore | MultiMemoryStore,
+        case_store: CaseStore | MultiCaseStore | None = None,
         short_term_utility_threshold: float = 0.3,
         long_term_utility_threshold: float = 0.6,
         confidence_threshold: float = 0.4,
@@ -37,6 +39,45 @@ class MemoryEditor:
         self.short_term_ttl_days = short_term_ttl_days
         self.dedup_threshold = dedup_threshold
 
+    def _add_card_to_store(self, card: ExperienceCard) -> ExperienceCard:
+        """向 memory store 添加卡片，支持单/多记忆库"""
+        if isinstance(self.memory_store, MultiMemoryStore):
+            # MultiMemoryStore 需要找一个活跃的 MemoryStore 来添加
+            # 默认添加到第一个活跃的记忆库
+            for store in self.memory_store._stores.values():
+                return store.add_card(card)
+            # 如果没有活跃记忆库，创建一个新的 MemoryStore
+            logger.warning("No active memory store, card not saved")
+            return card
+        else:
+            return self.memory_store.add_card(card)
+
+    def _save_store(self) -> None:
+        """保存 memory store"""
+        if isinstance(self.memory_store, MultiMemoryStore):
+            for store in self.memory_store._stores.values():
+                store._save()
+        else:
+            self.memory_store._save()
+
+    def _find_similar_in_store(
+        self,
+        venue_id: str | None,
+        theme: str,
+        content: str,
+        threshold: float,
+    ) -> ExperienceCard | None:
+        """在 memory store 中查找相似卡片"""
+        if isinstance(self.memory_store, MultiMemoryStore):
+            # 搜索所有活跃记忆库
+            for store in self.memory_store._stores.values():
+                result = store.find_similar(venue_id, theme, content, threshold)
+                if result:
+                    return result
+            return None
+        else:
+            return self.memory_store.find_similar(venue_id, theme, content, threshold)
+
     def admit(self, card: ExperienceCard) -> str:
         """
         决定卡片是否进入 memory
@@ -50,7 +91,7 @@ class MemoryEditor:
             return "rejected"
 
         # Check for duplicates
-        existing = self.memory_store.find_similar(
+        existing = self._find_similar_in_store(
             venue_id=card.venue_id,
             theme=card.theme,
             content=card.content,
@@ -62,14 +103,14 @@ class MemoryEditor:
 
         # Determine if short-term or long-term
         if card.utility >= self.long_term_utility_threshold:
-            result = self.memory_store.add_card(card)
+            self._add_card_to_store(card)
             logger.info("Card %s admitted to long-term memory", card.card_id[:8])
             return "admitted_long"
         elif card.utility >= self.short_term_utility_threshold:
             # Mark as short-term
             card.metadata["memory_tier"] = "short_term"
             card.metadata["expires_at"] = (datetime.utcnow() + timedelta(days=self.short_term_ttl_days)).isoformat()
-            result = self.memory_store.add_card(card)
+            self._add_card_to_store(card)
             logger.info("Card %s admitted to short-term memory", card.card_id[:8])
             return "admitted_short"
         else:
@@ -90,7 +131,7 @@ class MemoryEditor:
         # Update metadata
         existing.metadata["last_merged"] = datetime.utcnow().isoformat()
 
-        self.memory_store._save()
+        self._save_store()
         logger.info("Merged card %s into existing %s", new.card_id[:8], existing.card_id[:8])
         return "merged"
 
@@ -101,9 +142,18 @@ class MemoryEditor:
             return False
 
         try:
-            self.case_store.add_case(case)
-            logger.info("Added paper case %s", case.case_id[:8])
-            return True
+            if isinstance(self.case_store, MultiCaseStore):
+                # MultiCaseStore 需要找一个活跃的 CaseStore 来添加
+                for store in self.case_store._stores.values():
+                    store.add_case(case)
+                    logger.info("Added paper case %s", case.case_id[:8])
+                    return True
+                logger.warning("No active case store")
+                return False
+            else:
+                self.case_store.add_case(case)
+                logger.info("Added paper case %s", case.case_id[:8])
+                return True
         except Exception as e:
             logger.error("Failed to add paper case: %s", e)
             return False
@@ -113,7 +163,8 @@ class MemoryEditor:
         expired_count = 0
         now = datetime.utcnow()
 
-        for card in self.memory_store.cards:
+        cards = self.memory_store.cards if isinstance(self.memory_store, MemoryStore) else self.memory_store.list_cards()
+        for card in cards:
             if card.metadata.get("memory_tier") == "short_term":
                 expires_at_str = card.metadata.get("expires_at")
                 if expires_at_str:
@@ -126,7 +177,7 @@ class MemoryEditor:
                         pass
 
         if expired_count > 0:
-            self.memory_store._save()
+            self._save_store()
             logger.info("Expired %d short-term cards", expired_count)
 
         return expired_count
@@ -137,16 +188,24 @@ class MemoryEditor:
         threshold = timedelta(days=threshold_days)
         downweighted_count = 0
 
-        for card in self.memory_store.cards:
+        cards = self.memory_store.cards if isinstance(self.memory_store, MemoryStore) else self.memory_store.list_cards()
+        for card in cards:
             if not card.active:
                 continue
-            age = now - card.created_at
+            # created_at 可能是 datetime 或字符串
+            created_at = card.created_at
+            if isinstance(created_at, str):
+                try:
+                    created_at = datetime.fromisoformat(created_at)
+                except ValueError:
+                    continue
+            age = now - created_at
             if age > threshold and card.use_count == 0:
                 card.utility *= decay_factor
                 downweighted_count += 1
 
         if downweighted_count > 0:
-            self.memory_store._save()
+            self._save_store()
             logger.info("Downweighted %d unused cards", downweighted_count)
 
         return downweighted_count
@@ -155,7 +214,8 @@ class MemoryEditor:
         """将表现良好的 short-term 卡片提升为 long-term"""
         promoted_count = 0
 
-        for card in self.memory_store.cards:
+        cards = self.memory_store.cards if isinstance(self.memory_store, MemoryStore) else self.memory_store.list_cards()
+        for card in cards:
             if not card.active:
                 continue
             if card.metadata.get("memory_tier") == "short_term":
@@ -166,7 +226,7 @@ class MemoryEditor:
                     promoted_count += 1
 
         if promoted_count > 0:
-            self.memory_store._save()
+            self._save_store()
             logger.info("Promoted %d cards to long-term", promoted_count)
 
         return promoted_count

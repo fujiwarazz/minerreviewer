@@ -12,6 +12,8 @@ from storage.case_store import CaseStore
 from storage.doc_store import DocStore
 from storage.faiss_index import FaissIndex
 from storage.memory_store import MemoryStore
+from storage.multi_case_store import MultiCaseStore
+from storage.multi_memory_store import MultiMemoryStore
 from storage.milvus_store import MilvusConfig, MilvusStore
 
 logger = logging.getLogger(__name__)
@@ -30,8 +32,8 @@ class Retriever:
         embedding_cfg: EmbeddingConfig,
         vector_store: dict | None = None,
         index_root: str = "data/index",
-        case_store: CaseStore | None = None,
-        memory_store: MemoryStore | None = None,
+        case_store: CaseStore | MultiCaseStore | None = None,
+        memory_store: MemoryStore | MultiMemoryStore | None = None,
     ) -> None:
         self.venue_id = venue_id
         self.embedding_client = EmbeddingClient(embedding_cfg)
@@ -168,11 +170,8 @@ class Retriever:
         # 4. Retrieve critique cases (from memory with kind=critique)
         if self.memory_store:
             try:
-                critique_cases = [
-                    card for card in self.memory_store.cards
-                    if card.kind == "critique" and card.active and
-                    (card.venue_id is None or card.venue_id == self.venue_id)
-                ][:top_k_reviews]
+                critique_cards = self.memory_store.list_by_kind("critique", venue_id=self.venue_id)
+                critique_cases = critique_cards[:top_k_reviews]
                 logger.info("Retrieved %d critique cases", len(critique_cases))
             except Exception as e:
                 logger.warning("Failed to retrieve critique cases: %s", e)
@@ -180,11 +179,7 @@ class Retriever:
         # 5. Retrieve failure cards (from memory with kind=failure)
         if self.memory_store:
             try:
-                failure_cards = [
-                    card for card in self.memory_store.cards
-                    if card.kind == "failure" and card.active and
-                    (card.venue_id is None or card.venue_id == self.venue_id)
-                ][:5]
+                failure_cards = self.memory_store.list_by_kind("failure", venue_id=self.venue_id)[:5]
                 logger.info("Retrieved %d failure cards", len(failure_cards))
             except Exception as e:
                 logger.warning("Failed to retrieve failure cards: %s", e)

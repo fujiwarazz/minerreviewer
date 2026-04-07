@@ -64,6 +64,10 @@ llm:
   api_key: "${OPENAI_API_KEY:}"
 
 memory:
+  # 热插拔记忆库配置
+  use_hot_swap: true  # 启用热插拔记忆库（推荐）
+  registry_path: "data/processed/registry.json"  # 记忆库注册表路径
+  # 传统单文件模式（use_hot_swap=false 时使用）
   store_path: "data/processed/memory_store.json"
   case_store_path: "data/processed/cases.jsonl"
   similarity_threshold: 0.7

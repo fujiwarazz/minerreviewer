@@ -37,6 +37,9 @@ from pipeline.verify_decision import DecisionVerifier
 from storage.case_store import CaseStore
 from storage.doc_store import DocStore
 from storage.memory_store import MemoryStore
+from storage.memory_registry import MemoryRegistry
+from storage.multi_case_store import MultiCaseStore
+from storage.multi_memory_store import MultiMemoryStore
 from storage.milvus_store import MilvusConfig
 
 logger = logging.getLogger(__name__)
@@ -57,19 +60,47 @@ class ReviewPipeline:
         self._init_components()
 
     def _init_stores(self) -> None:
-        """初始化存储组件"""
+        """初始化存储组件 - 支持热插拔记忆库"""
         memory_cfg = self.config.get("memory", {})
-        self.memory_store = MemoryStore(memory_cfg.get("store_path", "data/processed/memory_store.json"))
-        self.case_store = CaseStore(
-            memory_cfg.get("case_store_path", "data/processed/cases.jsonl"),
-            embedding_client=self.embedding_client,
-            milvus_config=MilvusConfig(
-                host=self.config.get("vector_store", {}).get("host", "localhost"),
-                port=int(self.config.get("vector_store", {}).get("port", 19530)),
-                papers_collection="",
-                reviews_collection="",
-            ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
-        )
+        retrieval_cfg = self.config.get("retrieval", {})
+
+        # 使用 MemoryRegistry 管理热插拔记忆库
+        registry_path = memory_cfg.get("registry_path", "data/processed/registry.json")
+        self.registry = MemoryRegistry(registry_path)
+
+        # 使用 MultiCaseStore 和 MultiMemoryStore
+        use_hot_swap = memory_cfg.get("use_hot_swap", True)
+
+        if use_hot_swap:
+            # 热插拔模式：从注册表加载活跃记忆库
+            self.case_store = MultiCaseStore(
+                registry=self.registry,
+                embedding_client=self.embedding_client,
+                milvus_config=MilvusConfig(
+                    host=self.config.get("vector_store", {}).get("host", "localhost"),
+                    port=int(self.config.get("vector_store", {}).get("port", 19530)),
+                    papers_collection="",
+                    reviews_collection="",
+                ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
+                embedding_weight=retrieval_cfg.get("case_embedding_weight", 0.5),
+                signature_weight=retrieval_cfg.get("signature_weight", 0.4),
+                venue_match_bonus=retrieval_cfg.get("venue_match_bonus", 0.1),
+            )
+            self.memory_store = MultiMemoryStore(registry=self.registry)
+            logger.info("Using hot-swap memory: %d active memories", len(self.registry.get_active_memories()))
+        else:
+            # 传统模式：单一文件路径
+            self.memory_store = MemoryStore(memory_cfg.get("store_path", "data/processed/memory_store.json"))
+            self.case_store = CaseStore(
+                memory_cfg.get("case_store_path", "data/processed/cases.jsonl"),
+                embedding_client=self.embedding_client,
+                milvus_config=MilvusConfig(
+                    host=self.config.get("vector_store", {}).get("host", "localhost"),
+                    port=int(self.config.get("vector_store", {}).get("port", 19530)),
+                    papers_collection="",
+                    reviews_collection="",
+                ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
+            )
 
     def _init_components(self) -> None:
         """初始化处理组件"""
