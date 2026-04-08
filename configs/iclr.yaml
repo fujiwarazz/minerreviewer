@@ -77,6 +77,11 @@ memory:
   short_term_utility_threshold: 0.3
   long_term_utility_threshold: 0.6
   short_term_ttl_days: 30
+  # DeepReview-13K 热插拔记忆库
+  deepreview:
+    enabled: false  # 测试时禁用 DeepReview 召回
+    path: "data/processed/deepreview_cases_final.jsonl"
+    primary_area_weight: 0.1
 
 coverage_eval:
   enabled: true

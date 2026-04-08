@@ -46,7 +46,7 @@ class Calibrator:
         ratings = np.array([x[0] for x in data], dtype=float)
         decisions = [str(x[1]).lower() for x in data]
 
-        if self.mode == "three_way":
+        if self.mode in ("three_way", "ordinal"):
             return self._fit_three_way(ratings, decisions)
         else:
             return self._fit_binary(ratings, decisions)
@@ -138,7 +138,15 @@ class Calibrator:
         Returns:
             CalibrationResult 包含多路概率
         """
-        if self.mode == "three_way" and self.model_accept and self.model_reject and self.model_borderline:
+        # Try to load models if not already loaded
+        if self.model_accept is None or self.model_reject is None or self.model_borderline is None:
+            try:
+                self.load()
+            except FileNotFoundError:
+                pass  # Will fall back to binary or raise error
+
+        # Support both "ordinal" and "three_way" as aliases for three-way calibration
+        if self.mode in ("three_way", "ordinal") and self.model_accept and self.model_reject and self.model_borderline:
             return self._calibrate_three_way(rating)
         else:
             return self._calibrate_binary(rating)

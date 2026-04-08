@@ -140,3 +140,7 @@ Required for LLM/embedding services:
 - `MILVUS_HOST` (for vector store)
 
 Config files use `${VAR:default}` syntax for environment variable substitution. See `configs/iclr.example.yaml` for full template.
+
+What claude code should **NOT** do:
+1、hard code
+

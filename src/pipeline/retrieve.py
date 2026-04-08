@@ -9,6 +9,7 @@ import numpy as np
 from clients.embedding_client import EmbeddingClient, EmbeddingConfig
 from common.types import ExperienceCard, Paper, PaperCase, PaperSignature, Review, RetrievalBundle
 from storage.case_store import CaseStore
+from storage.deepreview_store import DeepReviewCaseStore
 from storage.doc_store import DocStore
 from storage.faiss_index import FaissIndex
 from storage.memory_store import MemoryStore
@@ -34,6 +35,7 @@ class Retriever:
         index_root: str = "data/index",
         case_store: CaseStore | MultiCaseStore | None = None,
         memory_store: MemoryStore | MultiMemoryStore | None = None,
+        deepreview_store: DeepReviewCaseStore | None = None,  # 热插拔 DeepReview 记忆
     ) -> None:
         self.venue_id = venue_id
         self.embedding_client = EmbeddingClient(embedding_cfg)
@@ -42,6 +44,7 @@ class Retriever:
         self.doc_store = DocStore()
         self.case_store = case_store
         self.memory_store = memory_store
+        self.deepreview_store = deepreview_store
 
     def retrieve(
         self,
@@ -149,6 +152,34 @@ class Retriever:
             except Exception as e:
                 logger.warning("Failed to retrieve paper cases: %s", e)
 
+        # 1.5. Retrieve from DeepReview store (热插拔记忆源)
+        if use_case_memory and self.deepreview_store:
+            try:
+                query_text = f"{target_paper.title}\n{target_paper.abstract}"
+                use_hybrid = self.vector_store.get("case_rerank_enabled", True)
+                # DeepReview 检索，支持按 primary_area 过滤
+                deepreview_results = self.deepreview_store.retrieve_cases(
+                    query_text=query_text,
+                    signature=paper_signature,
+                    top_k=min(top_k_papers * 2, 10),  # 补充案例
+                    venue_id=None,
+                    use_hybrid=use_hybrid,
+                    exclude_paper_id=target_paper.paper_id,
+                    before_year=target_year,
+                    primary_area=None,  # 可选：按 primary_area 过滤
+                )
+                # 合并到 similar_paper_cases
+                for case, scores in deepreview_results:
+                    if case not in similar_paper_cases:
+                        similar_paper_cases.append(case)
+                        case_scores.append({"case_id": case.case_id, "scores": scores})
+                logger.info(
+                    "Retrieved %d additional cases from DeepReview store",
+                    len(deepreview_results),
+                )
+            except Exception as e:
+                logger.warning("Failed to retrieve from DeepReview store: %s", e)
+
         # 2. Supporting papers (keep original related_papers)
         supporting_papers = related_papers
 
@@ -157,13 +188,27 @@ class Retriever:
             try:
                 # Get all themes from config or use common themes
                 themes = ["quality", "novelty", "clarity", "significance", "reproducibility", "soundness"]
+                max_cards_per_theme = 10  # 限制每个 theme 最多 10 张
+
                 for theme in themes:
                     cards = self.memory_store.list_active(
                         venue_id=self.venue_id,
                         theme=theme,
                     )
-                    policy_cards.extend(cards)
-                logger.info("Retrieved %d policy cards", len(policy_cards))
+                    # 按 utility + confidence 排序，取 top-k
+                    cards.sort(key=lambda c: (c.utility or 0.5) + (c.confidence or 0.5), reverse=True)
+                    policy_cards.extend(cards[:max_cards_per_theme])
+
+                # 去重（按 card_id）
+                seen_ids = set()
+                unique_cards = []
+                for card in policy_cards:
+                    if card.card_id not in seen_ids:
+                        seen_ids.add(card.card_id)
+                        unique_cards.append(card)
+                policy_cards = unique_cards
+
+                logger.info("Retrieved %d policy cards (limited to %d per theme)", len(policy_cards), max_cards_per_theme)
             except Exception as e:
                 logger.warning("Failed to retrieve policy cards: %s", e)
 

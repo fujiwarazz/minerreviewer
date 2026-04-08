@@ -506,12 +506,20 @@ def build_memory(venue: str, year: int, config_path: str,
             if title:
                 stats["with_title"] += 1
 
+            # 过滤：必须有关键字段
+            if not title or not result['rating'] or not result['decision']:
+                continue
+            if not result['strengths'] and not result['weaknesses']:
+                continue
+
             # 构建 PaperCase
             case = build_paper_case(result, title=title, abstract=abstract)
             cases.append(case)
 
             # 提取 ExperienceCards
             cards = extract_policy_cards(result)
+            # 过滤：只保留有明确 theme 的 cards（非 general）
+            cards = [c for c in cards if c.theme != "general"]
             all_cards.extend(cards)
 
             # 统计 decision
