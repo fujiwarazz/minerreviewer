@@ -216,7 +216,7 @@ class DecisionVerifier:
             "Verify the following review decision for consistency and quality.",
             "",
             f"Paper: {paper.title}",
-            f"Abstract: {paper.abstract[:500]}...",
+            f"Abstract: {paper.abstract[:1000]}...",
             "",
             f"Generated Rating: {arbiter_output.raw_rating}",
             f"Decision: {arbiter_output.decision_recommendation}",

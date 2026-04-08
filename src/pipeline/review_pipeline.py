@@ -35,6 +35,7 @@ from pipeline.retrieve import Retriever
 from pipeline.rewrite_criteria import CriteriaRewriter
 from pipeline.verify_decision import DecisionVerifier
 from storage.case_store import CaseStore
+from storage.deepreview_store import DeepReviewCaseStore
 from storage.doc_store import DocStore
 from storage.memory_store import MemoryStore
 from storage.memory_registry import MemoryRegistry
@@ -101,6 +102,31 @@ class ReviewPipeline:
                     reviews_collection="",
                 ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
             )
+
+        # 初始化 DeepReview 记忆库（热插拔）
+        self.deepreview_store: DeepReviewCaseStore | None = None
+        deepreview_cfg = memory_cfg.get("deepreview", {})
+        if deepreview_cfg.get("enabled", False):
+            try:
+                deepreview_path = deepreview_cfg.get("path", "data/processed/deepreview_cases_full.jsonl")
+                self.deepreview_store = DeepReviewCaseStore(
+                    path=deepreview_path,
+                    embedding_client=self.embedding_client,
+                    milvus_config=MilvusConfig(
+                        host=self.config.get("vector_store", {}).get("host", "localhost"),
+                        port=int(self.config.get("vector_store", {}).get("port", 19530)),
+                        papers_collection="",
+                        reviews_collection="",
+                    ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
+                    primary_area_weight=deepreview_cfg.get("primary_area_weight", 0.1),
+                )
+                logger.info(
+                    "Loaded DeepReview memory: %d cases, %d areas",
+                    len(self.deepreview_store.cases),
+                    len(self.deepreview_store.list_areas()),
+                )
+            except Exception as e:
+                logger.warning("Failed to load DeepReview memory: %s", e)
 
     def _init_components(self) -> None:
         """初始化处理组件"""
@@ -250,6 +276,7 @@ class ReviewPipeline:
             self.config.get("vector_store"),
             case_store=self.case_store,
             memory_store=self.memory_store,
+            deepreview_store=self.deepreview_store,  # 热插拔 DeepReview 记忆
         )
         use_case_memory = self.config.get("retrieval", {}).get("use_case_memory", True)
         bundle = retriever.retrieve(
@@ -511,7 +538,22 @@ class ReviewPipeline:
         logger.info("Running theme agents for %d themes with max_workers=%d", len(themes), max_workers)
 
         def review_theme(theme: str) -> ThemeOutput:
+            MIN_CRITERIA_PER_THEME = 2  # 每个主题最少标准数
             themed = [c for c in criteria if c.theme == theme]
+
+            # 如果该 theme 标准不足，借用其他 theme 的高优先级标准
+            if len(themed) < MIN_CRITERIA_PER_THEME:
+                # 获取其他 theme 的标准，按 priority 排序
+                others = [c for c in criteria if c.theme != theme]
+                others.sort(key=lambda x: x.priority if hasattr(x, 'priority') else 0, reverse=True)
+                needed = MIN_CRITERIA_PER_THEME - len(themed)
+                themed = themed + others[:needed]
+                if others[:needed]:
+                    logger.info(
+                        "Theme '%s' borrowed %d criteria from other themes (had %d, needed %d)",
+                        theme, len(others[:needed]), len([c for c in criteria if c.theme == theme]), MIN_CRITERIA_PER_THEME
+                    )
+
             themed_pol = themed_policies.get(theme.lower(), [])[:10]  # 每个主题最多10条 policy
             agent = ThemeAgent(
                 AgentConfig(name=f"theme_{theme}", llm=self.llm),

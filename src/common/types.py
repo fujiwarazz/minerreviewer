@@ -39,6 +39,7 @@ class PaperCase(BaseModel):
     title: str
     abstract: str
     paper_signature: PaperSignature | None = None
+    primary_area: str | None = None  # 论文研究方向（如 DeepReview-13K 的 primary_area）
     top_strengths: list[str] = Field(default_factory=list)
     top_weaknesses: list[str] = Field(default_factory=list)
     decisive_issues: list[str] = Field(default_factory=list)

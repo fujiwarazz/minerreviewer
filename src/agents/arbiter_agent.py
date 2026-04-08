@@ -49,18 +49,46 @@ class ArbiterAgent:
         acceptance = self._parse_float(response.get("acceptance_likelihood"))
         if strengths is None or weaknesses is None:
             strengths, weaknesses, raw_rating = self._fallback(theme_outputs, similar_cases)
+
+        # Extract additional fields from LLM response
+        rating_rationale = response.get("rating_rationale") or ""
+        decision_rationale = response.get("decision_rationale") or ""
+        key_decisive_issues = response.get("key_decisive_issues") or []
+
+        # Build verification summary based on the review
+        verification_summary = (
+            f"Rating: {raw_rating}, Decision: {response.get('decision_recommendation', 'N/A')}. "
+            f"Based on {len(strengths)} strengths and {len(weaknesses)} weaknesses identified across {len(theme_outputs)} themes."
+        )
+
+        # Build consistency summary from similar cases
+        consistency_summary = ""
+        if similar_cases:
+            import statistics
+            valid_cases = [c for c in similar_cases if c.rating is not None]
+            if valid_cases:
+                mean_rating = statistics.mean([c.rating for c in valid_cases])
+                consistency_summary = f"Rating aligned with {len(valid_cases)} similar papers (mean: {mean_rating:.1f})."
+
         trace = {
             "criteria_used": [c.criterion_id for c in policy_criteria],
             "policy_present": venue_policy is not None,
             "similar_cases_used": len(similar_cases) if similar_cases else 0,
-            "rating_rationale": response.get("rating_rationale"),
+            "rating_rationale": rating_rationale,
         }
+
         return ArbiterOutput(
             strengths=strengths,
             weaknesses=weaknesses,
             raw_rating=float(raw_rating) if raw_rating is not None else 0.0,
             decision_recommendation=response.get("decision_recommendation"),
             acceptance_likelihood=acceptance,
+            # New fields populated from LLM response
+            score_rationale=rating_rationale if rating_rationale else None,
+            decision_rationale=decision_rationale if decision_rationale else None,
+            key_decisive_issues=key_decisive_issues if isinstance(key_decisive_issues, list) else [],
+            verification_summary=verification_summary,
+            consistency_summary=consistency_summary if consistency_summary else None,
             trace=trace,
         )
 
@@ -162,9 +190,11 @@ class ArbiterAgent:
             cases_section,
             rating_reference,
             "",
+            
             "## Rating Scale Reference",
             ICLR_RATING_SCALE,
             "",
+            
             "## Theme Review Summaries",
             f"Total themes reviewed: {len(theme_outputs)}",
             f"Total strengths identified: {total_strengths}",
