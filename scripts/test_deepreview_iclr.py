@@ -22,10 +22,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from common.types import Paper
+from common.utils import write_json
 from eval.coverage import evaluate_coverage
 from pipeline.review_pipeline import ReviewPipeline
 
-# 全局 pipeline（线程安全的）
+def calc_avg_coverage(cov: dict | None) -> float | None:
+    """计算平均覆盖率"""
+    if not cov or "strengths" not in cov or "score" not in cov["strengths"]:
+        return None
+    s_score = cov["strengths"]["score"]
+    w_score = cov.get("weaknesses", {}).get("score", 0)
+    return (s_score + w_score) / 2
+
+
 _pipeline = None
 _pipeline_lock = threading.Lock()
 
@@ -123,7 +132,6 @@ def run_test(
     """运行单个论文的 review（线程安全）"""
     global _pipeline
 
-    # 获取或创建 pipeline（懒加载，线程安全）
     if _pipeline is None:
         with _pipeline_lock:
             if _pipeline is None:
@@ -141,7 +149,6 @@ def run_test(
         fulltext=None,
     )
 
-    # 调用 pipeline
     signature = pipeline._parse_paper(paper)
     bundle = pipeline._retrieve_multi_channel(paper, signature, target_year)
     content_criteria, policy_criteria = pipeline._mine_criteria(paper, bundle, target_year)
@@ -153,7 +160,6 @@ def run_test(
         similar_cases=bundle.similar_paper_cases
     )
 
-    # 提取相似案例信息
     similar_cases_info = []
     for case in bundle.similar_paper_cases:
         similar_cases_info.append({
@@ -166,7 +172,6 @@ def run_test(
             "top_weaknesses": case.top_weaknesses[:2] if case.top_weaknesses else [],
         })
 
-    # 提取 criteria 信息
     criteria_info = []
     for c in criteria:
         criteria_info.append({
@@ -175,7 +180,6 @@ def run_test(
             "kind": c.kind,
         })
 
-    # 提取 theme outputs
     theme_outputs_info = []
     for to in theme_outputs:
         theme_outputs_info.append({
@@ -185,7 +189,6 @@ def run_test(
             "severity_tags": to.severity_tags,
         })
 
-    # GT 和 Pred 比较
     gt_decision = paper_info.get("decision")
     gt_rating = parse_rating(paper_info.get("rating_raw", ""))
 
@@ -196,7 +199,6 @@ def run_test(
     pred_binary = "accept" if pred_decision and "accept" in pred_decision.lower() else "reject"
     match = gt_binary == pred_binary
 
-    # 计算覆盖率
     coverage_result = None
     if coverage_config and coverage_config.get("enabled", False):
         gt_reviews = extract_ground_truth_reviews(paper_info.get("reviewer_comments", []))
@@ -274,18 +276,13 @@ def main():
     print(f"并行线程: {args.n_workers}")
     print()
 
-    # 初始化 pipeline（提前加载）
-    print("Initializing pipeline...")
-    global _pipeline
     _pipeline = ReviewPipeline(args.config)
     print("Pipeline loaded!\n")
 
-    # 获取覆盖率配置
     coverage_config = None
     if args.coverage:
         coverage_config = _pipeline.config.get("coverage_eval", {"enabled": True, "method": "llm", "threshold": 0.55})
 
-    # 加载测试论文
     papers = load_deepreview_test_papers(
         args.input,
         year=args.year,
@@ -293,13 +290,11 @@ def main():
         seed=args.seed,
     )
 
-    # 并行运行测试
     results = []
     completed_count = 0
     print_lock = threading.Lock()
 
     def process_paper(paper_info: dict, idx: int) -> tuple[int, dict]:
-        """处理单篇论文"""
         nonlocal completed_count
         try:
             result = run_test(
@@ -319,11 +314,8 @@ def main():
                 print(f"  Match: {result['match']}")
 
                 if result.get("coverage"):
-                    cov = result["coverage"]
-                    if "strengths" in cov and "score" in cov["strengths"]:
-                        s_score = cov["strengths"]["score"]
-                        w_score = cov.get("weaknesses", {}).get("score", 0)
-                        avg_cov = (s_score + w_score) / 2
+                    avg_cov = calc_avg_coverage(result["coverage"])
+                    if avg_cov is not None:
                         print(f"  Coverage: avg={avg_cov:.2f}")
 
             return (idx, result)
@@ -344,28 +336,22 @@ def main():
             for i, paper in enumerate(papers)
         }
 
-        # 收集结果
         for future in as_completed(futures):
             idx, result = future.result()
             results.append((idx, result))
 
-    # 按 idx 排序
     results.sort(key=lambda x: x[0])
     results = [r for _, r in results]
 
-    # 汇总
     valid_results = [r for r in results if "error" not in r]
     correct = sum(1 for r in valid_results if r.get("match"))
     accuracy = correct / len(valid_results) if valid_results else 0
 
     total_coverage = []
     for r in valid_results:
-        if r.get("coverage"):
-            cov = r["coverage"]
-            if "strengths" in cov and "score" in cov["strengths"]:
-                s_score = cov["strengths"]["score"]
-                w_score = cov.get("weaknesses", {}).get("score", 0)
-                total_coverage.append((s_score + w_score) / 2)
+        avg_cov = calc_avg_coverage(r.get("coverage"))
+        if avg_cov is not None:
+            total_coverage.append(avg_cov)
 
     avg_coverage = sum(total_coverage) / len(total_coverage) if total_coverage else None
 
@@ -386,10 +372,8 @@ def main():
         "results": results,
     }
 
-    # 保存
     output_path = output_dir / f"deepreview_test_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False, default=str)
+    write_json(output_path, summary)
 
     print("\n" + "="*60)
     print("SUMMARY")

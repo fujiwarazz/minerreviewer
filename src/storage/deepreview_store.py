@@ -94,28 +94,23 @@ class DeepReviewCaseStore(CaseStore):
         Args:
             primary_area: 论文研究方向，用于过滤相似领域的案例
         """
-        candidates = self.cases
-        if venue_id:
-            candidates = [c for c in candidates if c.venue_id == venue_id]
-        if primary_area:
-            candidates = [c for c in candidates if c.primary_area == primary_area]
-        if exclude_paper_id:
-            candidates = [c for c in candidates if c.paper_id != exclude_paper_id]
-        if before_year:
-            candidates = [c for c in candidates if c.year is not None and c.year < before_year]
+        candidates = [
+            c for c in self.cases
+            if (not venue_id or c.venue_id == venue_id)
+            and (not primary_area or c.primary_area == primary_area)
+            and (not exclude_paper_id or c.paper_id != exclude_paper_id)
+            and (not before_year or (c.year is not None and c.year < before_year))
+        ]
 
         if not candidates:
             return []
 
-        # Step 1: Embedding retrieval
         embedding_results = self._embedding_retrieval(query_text, candidates)
 
-        # Step 2: Signature retrieval
         signature_results = {}
         if use_hybrid and signature:
             signature_results = self._signature_retrieval(signature, candidates)
 
-        # Step 3: Merge and rerank (包含 primary_area bonus)
         merged = self._merge_and_rerank_with_area(
             embedding_results,
             signature_results,
@@ -123,7 +118,6 @@ class DeepReviewCaseStore(CaseStore):
             primary_area,
         )
 
-        # Step 4: Diversity control
         merged = self._apply_diversity(merged, diversity_threshold)
 
         return merged[:top_k]
@@ -281,14 +275,12 @@ class DeepReviewCaseStore(CaseStore):
 
         # 如果需要生成 embedding，批量处理（分批避免内存问题）
         if embedding_client:
-            batch_size = 50  # 每批处理数量
-            all_embeddings = []
+            batch_size = 50
 
             for i in range(0, len(cases), batch_size):
                 batch_cases = cases[i:i+batch_size]
                 texts = [cls.get_case_text(c) for c in batch_cases]
                 embeddings = embedding_client.embed(texts)
-                all_embeddings.extend(embeddings)
 
                 for case, emb in zip(batch_cases, embeddings):
                     case.embedding = emb.tolist()
