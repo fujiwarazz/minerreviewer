@@ -65,9 +65,22 @@ class CriteriaPlanner:
 
         # 2. Add criteria from similar paper cases (case-driven evidence)
         for case in bundle.similar_paper_cases:
+            # 检查领域匹配，异领域降权
+            domain_penalty = 0
+            if signature and case.paper_signature:
+                case_domain = case.paper_signature.domain
+                target_domain = signature.domain
+                if case_domain and target_domain and case_domain != target_domain:
+                    domain_penalty = 3  # 异领域降权
+
+            # 或使用 primary_area（如果已有）
+            if case.primary_area and hasattr(bundle.target_paper, 'primary_area'):
+                if case.primary_area != getattr(bundle.target_paper, 'primary_area', None):
+                    domain_penalty = max(domain_penalty, 3)
+
             for criterion_text in case.transferable_criteria:
                 theme = self._infer_theme(criterion_text)
-                priority = 8  # 提高优先级，与 policy_mined 竞争
+                priority = 8 - domain_penalty  # 异领域 priority=5
                 if case.decision == "reject":
                     priority += 2  # Boost for rejected papers
                 activated.append(ActivatedCriterion(
@@ -75,7 +88,7 @@ class CriteriaPlanner:
                     criterion=criterion_text,
                     source="case_memory",
                     priority=priority,
-                    trigger_reason=f"Transferred from similar case {case.case_id[:8]} (decision={case.decision})",
+                    trigger_reason=f"Transferred from similar case {case.case_id[:8]} (decision={case.decision}, domain_penalty={domain_penalty})",
                     owner_agent=f"theme_{theme}",
                 ))
 
@@ -320,5 +333,6 @@ Focus on ensuring diverse themes - boost underrepresented themes."""
                 theme=ac.theme,
                 kind="content" if ac.source == "mined" else "policy",
                 source_ids=[ac.trigger_reason],
+                priority=ac.priority,  # 新增：保留 priority 用于借用排序
             ))
         return criteria

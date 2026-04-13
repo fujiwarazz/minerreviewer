@@ -75,6 +75,7 @@ class Criterion(BaseModel):
     theme: str
     kind: Literal["content", "policy"]
     source_ids: list[str] = Field(default_factory=list)
+    priority: int = 5  # 新增：用于 Theme Agent 借用时排序
 
 
 class RetrievalBundle(BaseModel):
