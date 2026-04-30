@@ -42,11 +42,16 @@ class MemoryEditor:
     def _add_card_to_store(self, card: ExperienceCard) -> ExperienceCard:
         """向 memory store 添加卡片，支持单/多记忆库"""
         if isinstance(self.memory_store, MultiMemoryStore):
-            # MultiMemoryStore 需要找一个活跃的 MemoryStore 来添加
-            # 默认添加到第一个活跃的记忆库
+            memory_year = card.metadata.get("memory_year")
+            routed_store = self.memory_store.get_store_for_venue_year(card.venue_id, memory_year)
+            if routed_store is not None:
+                return routed_store.add_card(card)
+
+            # 兼容旧逻辑：如果无法精确路由，回退到同 venue 的第一个活跃库
             for store in self.memory_store._stores.values():
-                return store.add_card(card)
-            # 如果没有活跃记忆库，创建一个新的 MemoryStore
+                if any(existing.venue_id == card.venue_id for existing in store.cards):
+                    return store.add_card(card)
+
             logger.warning("No active memory store, card not saved")
             return card
         else:
@@ -143,11 +148,17 @@ class MemoryEditor:
 
         try:
             if isinstance(self.case_store, MultiCaseStore):
-                # MultiCaseStore 需要找一个活跃的 CaseStore 来添加
-                for store in self.case_store._stores.values():
-                    store.add_case(case)
+                routed_store = self.case_store.get_store_for_venue_year(case.venue_id, case.year)
+                if routed_store is not None:
+                    routed_store.add_case(case)
                     logger.info("Added paper case %s", case.case_id[:8])
                     return True
+
+                for store in self.case_store._stores.values():
+                    if any(existing.venue_id == case.venue_id for existing in store.cases):
+                        store.add_case(case)
+                        logger.info("Added paper case %s", case.case_id[:8])
+                        return True
                 logger.warning("No active case store")
                 return False
             else:

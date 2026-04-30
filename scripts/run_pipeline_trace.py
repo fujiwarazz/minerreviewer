@@ -89,7 +89,7 @@ def run_pipeline_with_trace(paper: Paper, pipeline: ReviewPipeline, target_year:
     # Step 3: CriteriaMiner
     # =========================================================================
     print("Step 3: CriteriaMiner")
-    content_criteria, policy_criteria = pipeline._mine_criteria(paper, bundle, target_year)
+    content_criteria, policy_criteria = pipeline._mine_criteria(paper, signature, bundle, target_year)
     save_step("03_criteria_miner", bundle, {"content_criteria": content_criteria, "policy_criteria": policy_criteria}, output_dir)
 
     # =========================================================================

@@ -144,3 +144,22 @@ Config files use `${VAR:default}` syntax for environment variable substitution. 
 What claude code should **NOT** do:
 1、hard code
 
+## Important Rules
+
+**长时运行命令必须用nohup**:
+任何超过1分钟的命令（训练、评估、构建等）都必须用nohup启动，防止会话断开导致中断：
+```bash
+# 正确方式
+nohup python scripts/train_simplified_parallel.py --tokens tokens.txt --config configs/iclr.yaml --limit 300 --workers 10 > logs/train_300.log 2>&1 &
+
+# 错误方式（会断掉）
+python scripts/train_simplified_parallel.py ...  # 不要这样跑长时任务
+```
+
+监控进度：
+```bash
+tail -f logs/train_300.log
+grep -c "对比学习完成" logs/train_300.log
+wc -l data/processed/memory/ICLR_2024_learned/policy_cards.jsonl
+```
+

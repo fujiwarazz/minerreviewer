@@ -22,6 +22,10 @@ vector_store:
   papers_collection: "papers_iclr"
   reviews_collection: "reviews_iclr"
   coverage_gaps_collection: "coverage_gaps_iclr"
+  case_cross_venue: true
+  domain_memory_enabled: true
+  policy_memory_tiers: ["long_term", "short_term"]
+  policy_memory_max_per_theme: 6
 
 embedding:
   backend: "vllm"

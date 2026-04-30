@@ -31,6 +31,7 @@ class MultiCaseStore:
         embedding_weight: float = 0.5,
         signature_weight: float = 0.4,
         venue_match_bonus: float = 0.1,
+        skip_load: bool = False,  # 不从文件加载，用于训练时从空memory开始
     ) -> None:
         self.registry = registry or MemoryRegistry()
         self.embedding_client = embedding_client
@@ -41,7 +42,10 @@ class MultiCaseStore:
 
         # 按记忆库 ID 存储 CaseStore
         self._stores: dict[str, CaseStore] = {}
-        self._load_active_stores()
+
+        # skip_load=True 时不从文件加载
+        if not skip_load:
+            self._load_active_stores()
 
     def _load_active_stores(self) -> None:
         """加载所有活跃记忆库"""
@@ -49,17 +53,16 @@ class MultiCaseStore:
             memory_path = self.registry.get_memory_path(memory_id)
             if memory_path:
                 cases_path = memory_path / "cases.jsonl"
-                if cases_path.exists():
-                    store = CaseStore(
-                        path=cases_path,
-                        embedding_client=self.embedding_client,
-                        milvus_config=self.milvus_config,
-                        embedding_weight=self.embedding_weight,
-                        signature_weight=self.signature_weight,
-                        venue_match_bonus=self.venue_match_bonus,
-                    )
-                    self._stores[memory_id] = store
-                    logger.info("Loaded %d cases from %s", len(store.cases), memory_id)
+                store = CaseStore(
+                    path=cases_path,
+                    embedding_client=self.embedding_client,
+                    milvus_config=self.milvus_config,
+                    embedding_weight=self.embedding_weight,
+                    signature_weight=self.signature_weight,
+                    venue_match_bonus=self.venue_match_bonus,
+                )
+                self._stores[memory_id] = store
+                logger.info("Loaded %d cases from %s", len(store.cases), memory_id)
 
     def refresh(self) -> None:
         """刷新记忆库（重新加载活跃记忆库）"""
@@ -72,18 +75,17 @@ class MultiCaseStore:
             memory_path = self.registry.get_memory_path(memory_id)
             if memory_path:
                 cases_path = memory_path / "cases.jsonl"
-                if cases_path.exists():
-                    store = CaseStore(
-                        path=cases_path,
-                        embedding_client=self.embedding_client,
-                        milvus_config=self.milvus_config,
-                        embedding_weight=self.embedding_weight,
-                        signature_weight=self.signature_weight,
-                        venue_match_bonus=self.venue_match_bonus,
-                    )
-                    self._stores[memory_id] = store
-                    logger.info("Activated and loaded %s (%d cases)", memory_id, len(store.cases))
-                    return True
+                store = CaseStore(
+                    path=cases_path,
+                    embedding_client=self.embedding_client,
+                    milvus_config=self.milvus_config,
+                    embedding_weight=self.embedding_weight,
+                    signature_weight=self.signature_weight,
+                    venue_match_bonus=self.venue_match_bonus,
+                )
+                self._stores[memory_id] = store
+                logger.info("Activated and loaded %s (%d cases)", memory_id, len(store.cases))
+                return True
         return False
 
     def deactivate_memory(self, memory_id: str) -> bool:
@@ -233,3 +235,20 @@ class MultiCaseStore:
             use_hybrid=False,
         )
         return [case for case, scores in results if scores.get("final_score", 0) >= threshold]
+
+    def get_store_for_venue_year(self, venue_id: str | None, year: int | None) -> CaseStore | None:
+        """按会议和年份查找底层 case store，用于精确写回路由"""
+        if venue_id is None or year is None:
+            return None
+
+        memory_id = self.registry.get_memory_for_venue_year(venue_id, year)
+        if memory_id is None:
+            return None
+
+        store = self._stores.get(memory_id)
+        if store is not None:
+            return store
+
+        if self.activate_memory(memory_id):
+            return self._stores.get(memory_id)
+        return None

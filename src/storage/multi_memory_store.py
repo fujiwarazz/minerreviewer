@@ -21,11 +21,14 @@ logger = logging.getLogger(__name__)
 class MultiMemoryStore:
     """管理多个 MemoryStore，支持热插拔记忆库"""
 
-    def __init__(self, registry: MemoryRegistry | None = None) -> None:
+    def __init__(self, registry: MemoryRegistry | None = None, skip_load: bool = False) -> None:
         self.registry = registry or MemoryRegistry()
         self._stores: dict[str, MemoryStore] = {}
         self._cards_cache: list[ExperienceCard] | None = None  # 缓存聚合后的 cards
-        self._load_active_stores()
+
+        # skip_load=True 时不从文件加载，用于训练时从空memory开始
+        if not skip_load:
+            self._load_active_stores()
 
     @property
     def cards(self) -> list[ExperienceCard]:
@@ -40,10 +43,10 @@ class MultiMemoryStore:
             memory_path = self.registry.get_memory_path(memory_id)
             if memory_path:
                 cards_path = memory_path / "policy_cards.jsonl"
-                if cards_path.exists():
-                    store = MemoryStore(cards_path)
-                    self._stores[memory_id] = store
-                    logger.info("Loaded %d cards from %s", len(store.cards), memory_id)
+                store = MemoryStore(cards_path)
+                self._annotate_store_cards(memory_id, store)
+                self._stores[memory_id] = store
+                logger.info("Loaded %d cards from %s", len(store.cards), memory_id)
 
     def refresh(self) -> None:
         """刷新记忆库（重新加载活跃记忆库）"""
@@ -57,12 +60,12 @@ class MultiMemoryStore:
             memory_path = self.registry.get_memory_path(memory_id)
             if memory_path:
                 cards_path = memory_path / "policy_cards.jsonl"
-                if cards_path.exists():
-                    store = MemoryStore(cards_path)
-                    self._stores[memory_id] = store
-                    self._cards_cache = None  # 清空缓存
-                    logger.info("Activated and loaded %s (%d cards)", memory_id, len(store.cards))
-                    return True
+                store = MemoryStore(cards_path)
+                self._annotate_store_cards(memory_id, store)
+                self._stores[memory_id] = store
+                self._cards_cache = None  # 清空缓存
+                logger.info("Activated and loaded %s (%d cards)", memory_id, len(store.cards))
+                return True
         return False
 
     def deactivate_memory(self, memory_id: str) -> bool:
@@ -79,27 +82,29 @@ class MultiMemoryStore:
         self,
         venue_id: str | None = None,
         theme: str | None = None,
-        kind: Literal["policy", "case", "critique", "failure"] | None = None,
+        kind: Literal["strength", "critique", "failure"] | None = None,
+        scope: Literal["global", "venue", "paper_type", "domain"] | None = None,
     ) -> list[ExperienceCard]:
         """列出所有活跃记忆库中的卡片（向后兼容）"""
-        return self.list_cards(venue_id=venue_id, theme=theme, kind=kind)
+        return self.list_cards(venue_id=venue_id, theme=theme, kind=kind, scope=scope)
 
     def list_cards(
         self,
         venue_id: str | None = None,
         theme: str | None = None,
-        kind: Literal["policy", "case", "critique", "failure"] | None = None,
+        kind: Literal["strength", "critique", "failure"] | None = None,
+        scope: Literal["global", "venue", "paper_type", "domain"] | None = None,
     ) -> list[ExperienceCard]:
         """列出所有活跃记忆库中的卡片"""
         all_cards = []
         for store in self._stores.values():
-            cards = store.list_active(venue_id=venue_id, theme=theme, kind=kind)
+            cards = store.list_active(venue_id=venue_id, theme=theme, kind=kind, scope=scope)
             all_cards.extend(cards)
         return all_cards
 
     def list_by_kind(
         self,
-        kind: Literal["policy", "case", "critique", "failure"],
+        kind: Literal["strength", "critique", "failure"],
         venue_id: str | None = None,
     ) -> list[ExperienceCard]:
         """按类型列出卡片"""
@@ -128,7 +133,7 @@ class MultiMemoryStore:
     def get_cards_for_venue(
         self,
         venue_id: str,
-        kind: Literal["policy", "case", "critique", "failure"] = "policy",
+        kind: Literal["strength", "critique", "failure"] = "strength",
         top_k: int = 50,
     ) -> list[ExperienceCard]:
         """获取指定 venue 的卡片"""
@@ -144,6 +149,31 @@ class MultiMemoryStore:
         top_k: int = 20,
     ) -> list[ExperienceCard]:
         """获取指定 theme 的卡片"""
-        cards = self.list_cards(venue_id=venue_id, theme=theme, kind="policy")
+        cards = self.list_cards(venue_id=venue_id, theme=theme, kind="strength")
         cards.sort(key=lambda c: (c.utility or 0.5) + (c.confidence or 0.5), reverse=True)
         return cards[:top_k]
+
+    def get_store_for_venue_year(self, venue_id: str | None, year: int | None) -> MemoryStore | None:
+        """按会议和年份查找底层 store，用于精确写回路由"""
+        if venue_id is None or year is None:
+            return None
+
+        memory_id = self.registry.get_memory_for_venue_year(venue_id, year)
+        if memory_id is None:
+            return None
+
+        store = self._stores.get(memory_id)
+        if store is not None:
+            return store
+
+        if self.activate_memory(memory_id):
+            return self._stores.get(memory_id)
+        return None
+
+    def _annotate_store_cards(self, memory_id: str, store: MemoryStore) -> None:
+        """为聚合读取的 cards 补充来源记忆库信息"""
+        info = self.registry.get_memory_info(memory_id) or {}
+        for card in store.cards:
+            card.metadata.setdefault("_memory_id", memory_id)
+            card.metadata.setdefault("_memory_year", info.get("year"))
+            card.metadata.setdefault("_memory_venue", info.get("venue"))

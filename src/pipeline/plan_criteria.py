@@ -51,12 +51,13 @@ class CriteriaPlanner:
         )
         for card in relevant_policy_cards:
             priority = int((card.utility or 0.5) * 10)  # 移除 priority_boost_memory，降低优先级
+            source = "domain_memory" if card.scope == "domain" else "policy_memory"
             activated.append(ActivatedCriterion(
                 theme=card.theme or "quality",
                 criterion=card.content,
-                source="policy_memory",  # 明确标记来源
+                source=source,
                 priority=priority,
-                trigger_reason=f"Retrieved from venue policy memory (venue={card.venue_id}, utility={card.utility:.2f})",
+                trigger_reason=self._build_policy_trigger_reason(card),
                 required_evidence=card.trigger,
                 owner_agent=f"theme_{card.theme or 'quality'}",
             ))
@@ -79,6 +80,8 @@ class CriteriaPlanner:
                     domain_penalty = max(domain_penalty, 3)
 
             for criterion_text in case.transferable_criteria:
+                if not self._is_transferable_case_criterion(criterion_text):
+                    continue
                 theme = self._infer_theme(criterion_text)
                 priority = 8 - domain_penalty  # 异领域 priority=5
                 if case.decision == "reject":
@@ -169,6 +172,27 @@ class CriteriaPlanner:
             if any(kw in text_lower for kw in keywords):
                 return theme
         return "quality"
+
+    def _is_transferable_case_criterion(self, criterion_text: str) -> bool:
+        """再次过滤 case 中过于论文特定的 criteria，避免跨论文误迁移"""
+        text_lower = criterion_text.lower()
+        blocked_markers = [
+            "table ",
+            "figure ",
+            "section ",
+            "this paper",
+            "the paper",
+            "authors",
+            "appendix",
+        ]
+        return not any(marker in text_lower for marker in blocked_markers)
+
+    def _build_policy_trigger_reason(self, card: ExperienceCard) -> str:
+        """构造 policy/domain memory 的来源说明"""
+        if card.scope == "domain":
+            domain = card.metadata.get("memory_domain", "unknown")
+            return f"Retrieved from domain memory (domain={domain}, utility={card.utility:.2f})"
+        return f"Retrieved from venue policy memory (venue={card.venue_id}, utility={card.utility:.2f})"
 
     def _filter_relevant_policy_cards(
         self,

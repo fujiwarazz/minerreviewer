@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -165,7 +166,7 @@ class ReviewPipeline:
         bundle = self._retrieve_multi_channel(target, signature, target_year)
 
         # 3. Mine and distill criteria
-        content_criteria, policy_criteria = self._mine_criteria(target, bundle, target_year)
+        content_criteria, policy_criteria = self._mine_criteria(target, signature, bundle, target_year)
 
         # 4. Plan criteria with memory
         activated = self._plan_criteria(signature, bundle, content_criteria, policy_criteria)
@@ -174,7 +175,7 @@ class ReviewPipeline:
         criteria = self._rewrite_criteria(target, activated)
 
         # 6. Run theme agents
-        theme_outputs = self._run_theme_agents(target, criteria, bundle.policy_cards)
+        theme_outputs = self._run_theme_agents(target, criteria, bundle.policy_cards, bundle.critique_cases)
 
         # 7. Aggregate with arbiter (now includes policy_criteria and venue_policy)
         arbiter_output = self._aggregate(
@@ -244,6 +245,13 @@ class ReviewPipeline:
         arbiter_output.trace.update({
             "paper_signature": signature.model_dump() if signature else {},
             "retrieval": bundle.trace,
+            "memory_channel_usage": self._build_memory_channel_usage(
+                bundle=bundle,
+                activated=activated,
+                rewritten_criteria=criteria,
+                theme_outputs=theme_outputs,
+                arbiter_output=arbiter_output,
+            ),
             "verification": verification.model_dump(),
             "consistency": consistency.model_dump(),
             "calibration": calibration.model_dump(),
@@ -298,7 +306,7 @@ class ReviewPipeline:
         )
         return bundle
 
-    def _mine_criteria(self, target: Paper, bundle, target_year: int | None):
+    def _mine_criteria(self, target: Paper, signature, bundle, target_year: int | None):
         """挖掘和精炼标准"""
         distill_cfg = self.config["distill"]
 
@@ -315,8 +323,11 @@ class ReviewPipeline:
         sampled_reject = random.sample(reject_reviews, min(reject_count, len(reject_reviews)))
         random_reviews = sampled_accept + sampled_reject
 
+        # 提取领域信息用于 criteria mining
+        domain = signature.domain if signature else None
+
         miner = CriteriaMiner(self.llm, self.embedding_client, self.config.get("vector_store"))
-        content_criteria = miner.mine_content_criteria(target, bundle.related_papers, bundle.related_reviews)
+        content_criteria = miner.mine_content_criteria(domain, bundle.related_papers, bundle.related_reviews)
         policy_criteria = miner.mine_policy_criteria(bundle.venue_policy, random_reviews)
 
         # Distill criteria
@@ -389,12 +400,13 @@ class ReviewPipeline:
         # Convert policy cards to criteria format for arbiter
         policy_from_memory = []
         for card in policy_cards:
+            memory_prefix = "domain_memory" if getattr(card, "scope", None) == "domain" else "policy_memory"
             policy_from_memory.append(Criterion(
-                criterion_id=f"policy_memory_{card.card_id[:8]}",
+                criterion_id=f"{memory_prefix}_{card.card_id[:8]}",
                 text=card.content,
                 theme=card.theme,
                 kind="policy",
-                source_ids=[f"memory:{card.card_id}"],
+                source_ids=[f"memory:{card.card_id}", f"scope:{getattr(card, 'scope', 'venue')}"],
             ))
 
         # Merge all policy criteria: memory + mined
@@ -410,6 +422,82 @@ class ReviewPipeline:
         )
 
         return aggregator.aggregate(theme_outputs, all_policy_criteria, venue_policy, similar_cases)
+
+    def _build_memory_channel_usage(
+        self,
+        bundle,
+        activated: list[ActivatedCriterion],
+        rewritten_criteria: list[Criterion],
+        theme_outputs: list[ThemeOutput],
+        arbiter_output: ArbiterOutput,
+    ) -> dict:
+        """汇总各类 memory channel 的检索/规划/消费统计"""
+        criterion_source_by_id = {
+            criterion.criterion_id: activated[idx].source
+            for idx, criterion in enumerate(rewritten_criteria)
+            if idx < len(activated)
+        }
+
+        theme_used_ids = [
+            criterion_id
+            for output in theme_outputs
+            for criterion_id in output.criteria_used
+        ]
+        theme_used_sources = Counter(
+            criterion_source_by_id[criterion_id]
+            for criterion_id in theme_used_ids
+            if criterion_id in criterion_source_by_id
+        )
+
+        arbiter_used_ids = arbiter_output.trace.get("criteria_used", [])
+        arbiter_used_sources = Counter()
+        for criterion_id in arbiter_used_ids:
+            if criterion_id.startswith("domain_memory_"):
+                arbiter_used_sources["domain_memory"] += 1
+            elif criterion_id.startswith("policy_memory_"):
+                arbiter_used_sources["policy_memory"] += 1
+            else:
+                arbiter_used_sources["policy_mined"] += 1
+
+        planned_sources = Counter(item.source for item in activated)
+        retrieved_policy_cards = Counter(
+            "domain_memory" if getattr(card, "scope", None) == "domain" else "policy_memory"
+            for card in bundle.policy_cards
+        )
+
+        return {
+            "retrieved": {
+                "policy_memory": retrieved_policy_cards.get("policy_memory", 0),
+                "domain_memory": retrieved_policy_cards.get("domain_memory", 0),
+                "case_memory": len(bundle.similar_paper_cases),
+                "critique_memory": len(bundle.critique_cases),
+                "failure_memory": len(bundle.failure_cards),
+            },
+            "planned": {
+                "policy_memory": planned_sources.get("policy_memory", 0),
+                "domain_memory": planned_sources.get("domain_memory", 0),
+                "case_memory": planned_sources.get("case_memory", 0),
+                "failure_memory": planned_sources.get("failure_memory", 0),
+                "policy_mined": planned_sources.get("policy_mined", 0),
+                "content_mined": planned_sources.get("content_mined", 0),
+            },
+            "consumed": {
+                "theme": {
+                    "policy_memory": theme_used_sources.get("policy_memory", 0),
+                    "domain_memory": theme_used_sources.get("domain_memory", 0),
+                    "case_memory": theme_used_sources.get("case_memory", 0),
+                    "failure_memory": theme_used_sources.get("failure_memory", 0),
+                    "policy_mined": theme_used_sources.get("policy_mined", 0),
+                    "content_mined": theme_used_sources.get("content_mined", 0),
+                },
+                "arbiter": {
+                    "policy_memory": arbiter_used_sources.get("policy_memory", 0),
+                    "domain_memory": arbiter_used_sources.get("domain_memory", 0),
+                    "policy_mined": arbiter_used_sources.get("policy_mined", 0),
+                    "case_anchor": len(bundle.similar_paper_cases),
+                },
+            },
+        }
 
     def _verify_decision(
         self,
@@ -471,6 +559,7 @@ class ReviewPipeline:
             paper=paper,
             signature=signature,
             bundle=bundle,
+            target_year=paper.year,
         )
 
     def _update_memory(self, experience: DistillationResult) -> dict:
@@ -491,7 +580,7 @@ class ReviewPipeline:
         for card in experience.all_cards():
             result = self.memory_editor.admit(card)
             if result == "admitted_long" or result == "admitted_short":
-                if card.kind == "policy":
+                if card.kind == "strength":
                     updates["policy_cards"].append(card.card_id)
                 elif card.kind == "critique":
                     updates["critique_cards"].append(card.card_id)
@@ -500,7 +589,7 @@ class ReviewPipeline:
 
         return updates
 
-    def _run_theme_agents(self, target: Paper, criteria: list[Criterion], policy_cards: list = None) -> list[ThemeOutput]:
+    def _run_theme_agents(self, target: Paper, criteria: list[Criterion], policy_cards: list = None, critique_cards: list = None) -> list[ThemeOutput]:
         # 核心 themes - 始终评估这些维度
         core_themes = ["Clarity", "Quality", "Originality", "Significance", "Experiments"]
         themes = list(self.config.get("themes", []))
@@ -532,6 +621,18 @@ class ReviewPipeline:
                 themed_policies[card_theme] = []
             themed_policies[card_theme].append(card)
 
+        # Filter critique cards by theme (criticism patterns for weaknesses)
+        critique_cards = critique_cards or []
+        themed_critiques = {}
+        for card in critique_cards:
+            if hasattr(card, 'theme'):
+                card_theme = card.theme.lower() if card.theme else "general"
+            else:
+                card_theme = card.get("theme", "general").lower()
+            if card_theme not in themed_critiques:
+                themed_critiques[card_theme] = []
+            themed_critiques[card_theme].append(card)
+
         # Parallel execution of theme agents
         outputs: list[ThemeOutput] = []
         max_workers = min(len(themes), 6)
@@ -555,13 +656,14 @@ class ReviewPipeline:
                     )
 
             themed_pol = themed_policies.get(theme.lower(), [])[:10]  # 每个主题最多10条 policy
+            themed_crit = themed_critiques.get(theme.lower(), [])[:8]  # 每个主题最多8条 critique
             agent = ThemeAgent(
                 AgentConfig(name=f"theme_{theme}", llm=self.llm),
                 theme,
                 use_fulltext=use_fulltext,
                 max_fulltext_chars=max_fulltext_chars,
             )
-            return agent.review(target, themed, themed_pol)
+            return agent.review(target, themed, themed_pol, themed_crit)
 
         if max_workers > 1 and len(themes) > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:

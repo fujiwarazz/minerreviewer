@@ -229,6 +229,14 @@ def main():
     start_time = time.time()
 
     for parquet_path in parquet_files:
+        # 跳过已处理的文件（已存在 _sw 版本）
+        output_name = parquet_path.stem + "_sw.parquet"
+        output_path = output_dir / output_name
+        if output_path.exists():
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Skipping: {parquet_path.name} (already processed)")
+            continue
+
         logger.info(f"\n{'='*60}")
         logger.info(f"Processing: {parquet_path.name}")
 

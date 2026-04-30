@@ -123,13 +123,13 @@ class Retriever:
             try:
                 query_text = f"{target_paper.title}\n{target_paper.abstract}"
                 use_hybrid = self.vector_store.get("case_rerank_enabled", True)
+                allow_cross_venue_cases = self.vector_store.get("case_cross_venue", True)
                 # Retrieve more candidates for balancing
-                # Don't restrict to same venue - allow cross-venue retrieval for better rating anchors
                 results = self.case_store.retrieve_cases(
                     query_text=query_text,
                     signature=paper_signature,
                     top_k=min(top_k_papers * 4, 20),  # Get more candidates
-                    venue_id=None,  # Allow all venues for better rating diversity
+                    venue_id=None if allow_cross_venue_cases else self.venue_id,
                     use_hybrid=use_hybrid,
                     exclude_paper_id=target_paper.paper_id,  # 避免数据泄露
                     before_year=target_year,  # 只用目标年份之前的案例
@@ -186,15 +186,40 @@ class Retriever:
         # 3. Retrieve policy cards from memory
         if self.memory_store:
             try:
-                # Get all themes from config or use common themes
+                allowed_tiers = set(self.vector_store.get("policy_memory_tiers", ["long_term", "short_term"]))
                 themes = ["quality", "novelty", "clarity", "significance", "reproducibility", "soundness"]
-                max_cards_per_theme = 10  # 限制每个 theme 最多 10 张
+                max_cards_per_theme = int(self.vector_store.get("policy_memory_max_per_theme", 6))
+                domain_enabled = bool(self.vector_store.get("domain_memory_enabled", True))
+                target_domain = paper_signature.domain if paper_signature else None
 
                 for theme in themes:
-                    cards = self.memory_store.list_active(
+                    venue_cards = self.memory_store.list_active(
                         venue_id=self.venue_id,
                         theme=theme,
+                        kind="strength",
+                        scope="venue",
                     )
+                    cards = [
+                        card for card in venue_cards
+                        if self._card_matches_policy_filters(card, target_year, allowed_tiers)
+                    ]
+
+                    if domain_enabled and target_domain:
+                        domain_cards = self.memory_store.list_active(
+                            theme=theme,
+                            kind="strength",
+                            scope="domain",
+                        )
+                        cards.extend(
+                            card for card in domain_cards
+                            if self._card_matches_policy_filters(
+                                card,
+                                target_year,
+                                allowed_tiers,
+                                target_domain=target_domain,
+                            )
+                        )
+
                     # 按 utility + confidence 排序，取 top-k
                     cards.sort(key=lambda c: (c.utility or 0.5) + (c.confidence or 0.5), reverse=True)
                     policy_cards.extend(cards[:max_cards_per_theme])
@@ -252,6 +277,33 @@ class Retriever:
             venue_policy=policy,
             trace=trace,
         )
+
+    def _card_matches_policy_filters(
+        self,
+        card: ExperienceCard,
+        target_year: int | None,
+        allowed_tiers: set[str],
+        target_domain: str | None = None,
+    ) -> bool:
+        """过滤 policy memory，避免错误的类型和年份混入最终决策"""
+        tier = card.metadata.get("memory_tier", "long_term")
+        if allowed_tiers and tier not in allowed_tiers:
+            return False
+
+        memory_year = card.metadata.get("memory_year") or card.metadata.get("_memory_year")
+        if target_year is not None and isinstance(memory_year, int) and memory_year >= target_year:
+            return False
+
+        memory_type = card.metadata.get("memory_type")
+        if memory_type and memory_type != "generic_policy":
+            return False
+
+        if card.scope == "domain":
+            memory_domain = card.metadata.get("memory_domain")
+            if not target_domain or memory_domain != target_domain:
+                return False
+
+        return True
 
     def retrieve_similar_reviews(self, query_text: str, top_k: int, target_year: int | None, exclude_paper_id: str | None = None) -> list[Review]:
         backend = self.vector_store.get("backend", "faiss")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -45,16 +46,16 @@ class ExperienceDistiller:
         result.paper_case = paper_case
 
         # 2. Extract policy updates from successful criteria
-        policy_updates = self._extract_policy_updates(arbiter_output, bundle)
+        policy_updates = self._extract_policy_updates(arbiter_output, bundle, signature)
         result.policy_updates = policy_updates
 
         # 3. Extract critique cases from weaknesses
-        critique_cases = self._extract_critique_cases(arbiter_output, paper)
+        critique_cases = self._extract_critique_cases(arbiter_output, paper, signature)
         result.critique_cases = critique_cases
 
         # 4. Extract failure patterns if applicable
         if self._is_failure_case(arbiter_output):
-            failure_cards = self._extract_failure_patterns(arbiter_output, paper)
+            failure_cards = self._extract_failure_patterns(arbiter_output, paper, signature)
             result.failure_cards = failure_cards
 
         return result
@@ -80,7 +81,7 @@ class ExperienceDistiller:
             decision=arbiter_output.decision_recommendation,
             rating=arbiter_output.raw_rating,
             source_review_ids=[],
-            transferable_criteria=self._extract_transferable_criteria(arbiter_output),
+            transferable_criteria=self._extract_transferable_criteria(arbiter_output, paper, signature),
             failure_patterns=[],
         )
 
@@ -93,35 +94,49 @@ class ExperienceDistiller:
                 issues.append(weakness)
         return issues[:3]
 
-    def _extract_transferable_criteria(self, arbiter_output: ArbiterOutput) -> list[str]:
-        """提取可迁移的审稿标准"""
+    def _extract_transferable_criteria(
+        self,
+        arbiter_output: ArbiterOutput,
+        paper: Paper,
+        signature: PaperSignature | None,
+    ) -> list[str]:
+        """提取可迁移的审稿标准，只保留抽象化后仍成立的经验"""
         criteria: list[str] = []
         for weakness in arbiter_output.weaknesses:
-            if len(weakness) > 20 and any(kw in weakness.lower() for kw in ["should", "could", "would", "needs", "lacks"]):
-                criteria.append(weakness[:200])
-        return list(set(criteria))[:5]
+            if not self._is_generalizable_memory(weakness, paper, signature):
+                continue
+            if len(weakness) > 20 and any(kw in weakness.lower() for kw in ["should", "could", "would", "needs", "lacks", "must"]):
+                criteria.append(self._normalize_memory_text(weakness)[:200])
+        return list(dict.fromkeys(criteria))[:5]
 
     def _extract_policy_updates(
         self,
         arbiter_output: ArbiterOutput,
         bundle: RetrievalBundle,
+        signature: PaperSignature | None,
     ) -> list[ExperienceCard]:
         """提取策略更新"""
         cards: list[ExperienceCard] = []
 
         # Extract from strengths for high-quality patterns
         for strength in arbiter_output.strengths:
-            if len(strength) > 30:
+            if len(strength) > 30 and self._is_generalizable_memory(strength, bundle.target_paper):
                 card = ExperienceCard(
                     card_id=str(uuid.uuid4()),
-                    kind="policy",
-                    scope="venue",
+                    kind="strength",
+                    scope=self._policy_scope(signature),
                     venue_id=bundle.target_paper.venue_id,
                     theme="quality",
-                    content=strength,
+                    content=self._normalize_memory_text(strength),
                     utility=arbiter_output.raw_rating / 10.0,
                     confidence=0.5,
                     source_ids=[],
+                    metadata={
+                        "memory_year": bundle.target_paper.year,
+                        "memory_type": "generic_policy",
+                        "memory_domain": signature.domain if signature else None,
+                        "memory_paper_type": signature.paper_type if signature else None,
+                    },
                 )
                 cards.append(card)
 
@@ -131,25 +146,32 @@ class ExperienceDistiller:
         self,
         arbiter_output: ArbiterOutput,
         paper: Paper,
+        signature: PaperSignature | None,
     ) -> list[ExperienceCard]:
         """提取批评案例"""
         cards: list[ExperienceCard] = []
 
         for weakness in arbiter_output.weaknesses:
-            if len(weakness) > 30:
+            if len(weakness) > 30 and self._is_generalizable_memory(weakness, paper):
                 # Infer theme from weakness content
                 theme = self._infer_theme(weakness)
                 card = ExperienceCard(
                     card_id=str(uuid.uuid4()),
                     kind="critique",
-                    scope="venue",
+                    scope=self._policy_scope(signature),
                     venue_id=paper.venue_id,
                     theme=theme,
-                    content=weakness,
+                    content=self._normalize_memory_text(weakness),
                     trigger=[],
                     utility=0.5,
                     confidence=0.5,
                     source_ids=[],
+                    metadata={
+                        "memory_year": paper.year,
+                        "memory_type": "generic_critique",
+                        "memory_domain": signature.domain if signature else None,
+                        "memory_paper_type": signature.paper_type if signature else None,
+                    },
                 )
                 cards.append(card)
 
@@ -164,24 +186,34 @@ class ExperienceDistiller:
         self,
         arbiter_output: ArbiterOutput,
         paper: Paper,
+        signature: PaperSignature | None,
     ) -> list[ExperienceCard]:
         """提取失败模式"""
         cards: list[ExperienceCard] = []
 
         for weakness in arbiter_output.weaknesses:
-            if any(kw in weakness.lower() for kw in ["missing", "lacks", "insufficient", "incomplete", "unclear"]):
+            if (
+                any(kw in weakness.lower() for kw in ["missing", "lacks", "insufficient", "incomplete", "unclear"])
+                and self._is_generalizable_memory(weakness, paper)
+            ):
                 theme = self._infer_theme(weakness)
                 card = ExperienceCard(
                     card_id=str(uuid.uuid4()),
                     kind="failure",
-                    scope="venue",
+                    scope=self._policy_scope(signature),
                     venue_id=paper.venue_id,
                     theme=theme,
-                    content=weakness,
+                    content=self._normalize_memory_text(weakness),
                     trigger=[],
                     utility=0.3,  # Low utility for failure patterns
                     confidence=0.5,
                     source_ids=[],
+                    metadata={
+                        "memory_year": paper.year,
+                        "memory_type": "generic_failure",
+                        "memory_domain": signature.domain if signature else None,
+                        "memory_paper_type": signature.paper_type if signature else None,
+                    },
                 )
                 cards.append(card)
 
@@ -202,6 +234,70 @@ class ExperienceDistiller:
             if any(kw in text_lower for kw in keywords):
                 return theme
         return "quality"
+
+    def _is_generalizable_memory(
+        self,
+        text: str,
+        paper: Paper | None = None,
+        signature: PaperSignature | None = None,
+    ) -> bool:
+        """过滤明显依赖原论文实体的句子，避免直接升格成通用 memory"""
+        text_lower = text.lower().strip()
+        if len(text_lower) < 25:
+            return False
+
+        entity_like_patterns = [
+            r"\btable\s+\d+\b",
+            r"\bfigure\s+\d+\b",
+            r"\bsection\s+\d+\b",
+            r"\b\d+(\.\d+)?%\b",
+            r"\b\d+x\b",
+            r"\bstate[- ]of[- ]the[- ]art\b",
+        ]
+        if any(re.search(pattern, text_lower) for pattern in entity_like_patterns):
+            return False
+
+        non_transferable_markers = [
+            "this paper",
+            "the paper",
+            "our method",
+            "our approach",
+            "authors",
+            "figure",
+            "table",
+            "appendix",
+            "section",
+        ]
+        if any(marker in text_lower for marker in non_transferable_markers):
+            return False
+
+        if paper:
+            title_tokens = {
+                token.lower()
+                for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", paper.title)
+            }
+            if any(token in text_lower for token in title_tokens):
+                return False
+
+        if signature:
+            dataset_tokens = {token.lower() for token in signature.datasets}
+            if any(token and token in text_lower for token in dataset_tokens):
+                return False
+
+        return True
+
+    def _normalize_memory_text(self, text: str) -> str:
+        """轻量归一化，减少具体论文痕迹"""
+        normalized = re.sub(r"\s+", " ", text).strip()
+        normalized = re.sub(r"\bthis paper\b", "the work", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"\bour method\b", "the proposed method", normalized, flags=re.IGNORECASE)
+        return normalized
+
+    def _policy_scope(self, signature: PaperSignature | None) -> str:
+        """为通用记忆分配作用域：优先方向级，其次会议级"""
+        if signature and signature.domain:
+            return "domain"
+        return "venue"
 
 
 class DistillationResult:

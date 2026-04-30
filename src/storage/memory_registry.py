@@ -145,6 +145,19 @@ class MemoryRegistry:
                 result.append(memory_id)
         return result
 
+    def get_memory_for_venue_year(self, venue: str, year: int | None) -> str | None:
+        """获取指定会议和年份的活跃记忆库 ID"""
+        if year is None:
+            return None
+
+        for memory_id in self.get_active_memories():
+            info = self.get_memory_info(memory_id)
+            if not info:
+                continue
+            if info.get("venue") == venue and info.get("year") == year:
+                return memory_id
+        return None
+
 
 # 导入 datetime（放在文件末尾避免循环导入）
 from datetime import datetime

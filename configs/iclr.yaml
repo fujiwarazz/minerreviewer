@@ -1,91 +1,39 @@
 venue_id: "ICLR"
 
-retrieval:
-  top_k_papers: 4
-  top_k_reviews: 12
-  unrelated_k: 0  # 不再需要 unrelated papers
-  similarity_threshold: 0.35
-  use_case_memory: true  # 启用 case-based retrieval
-  # Hybrid retrieval 配置
-  case_rerank_enabled: true  # 启用 embedding + signature 融合
-  case_embedding_weight: 0.5  # embedding 分数权重
-  case_signature_weight: 0.4  # signature 分数权重
-  case_venue_match_bonus: 0.1  # venue 匹配奖励
-
-vector_store:
-  backend: "milvus"
-  host: "${MILVUS_HOST:localhost}"
-  port: 19530
-  papers_collection: "papers_iclr"
-  reviews_collection: "reviews_iclr"
-  coverage_gaps_collection: "coverage_gaps_iclr"
+llm:
+  backend: "curl"
+  model: "gemini-3-flash-preview"
+  temperature: 0.1
+  base_url: "https://one-api.bltcy.top/v1"
+  api_key: "${OPENAI_API_KEY:}"
 
 embedding:
   backend: "vllm"
-  model: "${EMBEDDING_MODEL:bge-embedding}"
-  vllm_base_url: "${EMBEDDING_BASE_URL:http://10.20.49.150:8001/v1}"
+  model: "bge-embedding"
+  vllm_base_url: "http://10.20.49.150:8001/v1"
+
+memory:
+  registry_path: "data/processed/registry.json"
+  use_hot_swap: true
+
+retrieval:
+  top_k_papers: 4
+  top_k_reviews: 12
+  top_k_cases: 4
+  top_k_policy_cards: 6
+  top_k_critique_cards: 12
+  top_k_failure_cards: 5
+  similarity_threshold: 0.35
+  use_case_memory: true
 
 distill:
   max_total: 12
   max_per_theme: 4
   dedup_threshold: 0.86
-  seed: 42
-  strategy: "random"
-  epsilon: 1.0
 
-policy_mining:
-  sample_accept: 3
-  sample_reject: 3
-
-# 新配置：评分一致性检查（替代旧的 decision_scoring）
-score_consistency:
-  rating_tolerance: 1.5
-  deviation_threshold: 2.0
-  min_samples: 3
-  prefer_cases: true  # 优先使用 case-level stats
-
-review:
-  use_fulltext: true
-  max_fulltext_chars: 12000
-
-themes: []
-
-calibration:
-  method: "isotonic"
-  mode: "ordinal"  # ordinal/three_way/binary
-  min_history: 100
-
-llm:
-  backend: "${LLM_BACKEND:openai}"
-  model: "${LLM_MODEL:qwen-plus}"
-  temperature: 0.1
-  base_url: "${LLM_BASE_URL:}"
-  # API key 从环境变量读取，不要在配置文件中明文存储
-  api_key: "${OPENAI_API_KEY:}"
-
-memory:
-  # 热插拔记忆库配置
-  use_hot_swap: true  # 启用热插拔记忆库（推荐）
-  registry_path: "data/processed/registry.json"  # 记忆库注册表路径
-  # 传统单文件模式（use_hot_swap=false 时使用）
-  store_path: "data/processed/memory_store.json"
-  case_store_path: "data/processed/cases.jsonl"
-  similarity_threshold: 0.7
-  stable_margin: 0.5
-  borderline_low: 0.45
-  borderline_high: 0.6
-  short_term_utility_threshold: 0.3
-  long_term_utility_threshold: 0.6
-  short_term_ttl_days: 30
-  # DeepReview-13K 热插拔记忆库
-  deepreview:
-    enabled: false  # 测试时禁用 DeepReview 召回
-    path: "data/processed/deepreview_cases_final.jsonl"
-    primary_area_weight: 0.1
-
-coverage_eval:
-  enabled: true
-  method: "llm"
-  threshold: 0.55
-  max_points: 12
-  store_gaps: true
+vector_store:
+  backend: "milvus"
+  host: "10.20.49.150"
+  port: 19530
+  papers_collection: "papers_iclr"
+  reviews_collection: "reviews_iclr"

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryStore:
-    """经验卡片存储，支持多种类型：policy/case/critique/failure"""
+    """经验卡片存储，支持多种类型：strength/critique/failure"""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -42,7 +42,8 @@ class MemoryStore:
         self,
         venue_id: str | None = None,
         theme: str | None = None,
-        kind: Literal["policy", "case", "critique", "failure"] | None = None,
+        kind: Literal["strength", "critique", "failure"] | None = None,
+        scope: Literal["global", "venue", "paper_type", "domain"] | None = None,
     ) -> list[ExperienceCard]:
         """列出活跃的卡片，支持多条件过滤"""
         cards = [card for card in self.cards if card.active]
@@ -52,6 +53,8 @@ class MemoryStore:
             cards = [card for card in cards if card.theme == theme]
         if kind is not None:
             cards = [card for card in cards if card.kind == kind]
+        if scope is not None:
+            cards = [card for card in cards if card.scope == scope]
         return cards
 
     def list_by_kind(
@@ -84,7 +87,7 @@ class MemoryStore:
             new_version = 1
         card = ExperienceCard(
             card_id=str(uuid.uuid4()),
-            kind="policy",
+            kind="strength",
             scope="venue",
             venue_id=venue_id,
             theme=theme,

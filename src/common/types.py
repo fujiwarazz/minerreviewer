@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Paper(BaseModel):
@@ -131,9 +131,16 @@ class CalibrationArtifact(BaseModel):
 
 
 class ExperienceCard(BaseModel):
-    """经验卡片，支持多种类型：policy/case/critique/failure"""
+    """经验卡片，记录可迁移的评价规律
+
+    kind 类型：
+    - strength: 正面评价模式（什么样的论文值得肯定）
+    - critique: 批评模式（常见批评角度）
+    - failure: 拒稿原因（导致reject的关键问题）
+    - policy: 兼容旧类型，自动迁移为strength
+    """
     card_id: str
-    kind: Literal["policy", "case", "critique", "failure"] = "policy"
+    kind: Literal["strength", "critique", "failure", "policy"] = "strength"
     scope: Literal["global", "venue", "paper_type", "domain"] = "venue"
     venue_id: str | None = None
     theme: str
@@ -148,6 +155,14 @@ class ExperienceCard(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     source_trace: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator('kind', mode='before')
+    @classmethod
+    def migrate_policy_kind(cls, v):
+        """兼容旧类型：policy自动迁移为strength"""
+        if v == "policy":
+            return "strength"
+        return v
 
 
 class ActivatedCriterion(BaseModel):

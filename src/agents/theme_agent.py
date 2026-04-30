@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from agents.base import AgentConfig
-from common.types import Criterion, Paper, ThemeOutput
+from common.types import Criterion, ExperienceCard, Paper, ThemeOutput
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +30,35 @@ class ThemeAgent:
         self.use_fulltext = use_fulltext
         self.max_fulltext_chars = max_fulltext_chars
 
-    def review(self, target: Paper, criteria: list[Criterion], policy_cards: list = None) -> ThemeOutput:
+    def review(self, target: Paper, criteria: list[Criterion], policy_cards: list[ExperienceCard] = None, critique_cards: list[ExperienceCard] = None) -> ThemeOutput:
         if not criteria and not policy_cards:
             return ThemeOutput(theme=self.theme, strengths=[], weaknesses=[], severity_tags=[], criteria_used=[])
         policy_cards = policy_cards or []
-        prompt = self._prompt(target, criteria, policy_cards)
+        critique_cards = critique_cards or []
+        prompt = self._prompt(target, criteria, policy_cards, critique_cards)
         response = self.config.llm.generate_json(prompt)
+
+        # 处理 LLM 返回 list 格式的情况
+        if isinstance(response, list):
+            # 尝试从 list 中提取内容
+            strengths = []
+            weaknesses = []
+            for item in response:
+                if isinstance(item, dict):
+                    if "strength" in item or "point" in item:
+                        strengths.append(item)
+                    elif "weakness" in item or "issue" in item:
+                        weaknesses.append(item)
+            logger.warning(f"[{self.theme}] LLM returned list format, extracted {len(strengths)} strengths, {len(weaknesses)} weaknesses")
+            return ThemeOutput(
+                theme=self.theme,
+                strengths=strengths,
+                weaknesses=weaknesses,
+                severity_tags=[],
+                notes=None,
+                criteria_used=[c.criterion_id for c in criteria],
+            )
+
         strengths = response.get("strengths", [])
         weaknesses = response.get("weaknesses", [])
         severity_tags = response.get("severity_tags", [])
@@ -59,7 +82,7 @@ class ThemeAgent:
             criteria_used=[c.criterion_id for c in criteria],
         )
 
-    def _prompt(self, target: Paper, criteria: list[Criterion], policy_cards: list = None) -> str:
+    def _prompt(self, target: Paper, criteria: list[Criterion], policy_cards: list[ExperienceCard] = None, critique_cards: list[ExperienceCard] = None) -> str:
         serialized = [c.model_dump() for c in criteria]
         fulltext = ""
         if self.use_fulltext and target.fulltext:
@@ -87,6 +110,24 @@ class ThemeAgent:
             if policy_items:
                 policy_section = "\n## Review Standards (Policy Cards)\n" + "\n".join(policy_items) + "\n"
 
+        # Add critique cards section (criticism patterns for weaknesses)
+        critique_cards = critique_cards or []
+        critique_section = ""
+        if critique_cards:
+            critique_items = []
+            for card in critique_cards[:8]:  # 最多 8 条 critique
+                if hasattr(card, 'content'):
+                    content = card.content or ""
+                    trigger = card.trigger or []
+                else:
+                    content = card.get("content", "")
+                    trigger = card.get("trigger", [])
+                if content:
+                    trigger_str = f" (trigger: {', '.join(trigger[:2])})" if trigger else ""
+                    critique_items.append(f"- {content[:120]}{trigger_str}")
+            if critique_items:
+                critique_section = "\n## Common Criticism Patterns (Critique Cards)\nWhen identifying weaknesses, also check for these common criticism angles:\n" + "\n".join(critique_items) + "\n"
+
         return "\n".join([
             f"You are an expert reviewer focusing on the '{self.theme}' aspect of an ICLR paper submission.",
             "",
@@ -103,6 +144,7 @@ class ThemeAgent:
             REVIEW_EXAMPLES,
             "",
             policy_section,
+            critique_section,
             "## Critical Evaluation Guidelines",
             "When identifying weaknesses, also consider these high-level questions:",
             "",
