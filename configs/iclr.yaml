@@ -16,6 +16,20 @@ memory:
   registry_path: "data/processed/registry.json"
   use_hot_swap: true
 
+  # === 新增：向量记忆配置 ===
+  vector_memory:
+    enabled: true
+    collection: "agent_memories"  # Milvus collection名称
+    embedding_weight: 0.6  # 向量检索权重
+    metadata_weight: 0.3  # metadata分数权重
+    utility_weight: 0.1  # utility权重
+
+  # === 新增：Agent记忆分配配置 ===
+  agent_allocation:
+    enabled: true
+    share_strength_with_arbiter: true  # strength卡片是否共享给arbiter
+    max_memories_per_agent: 50  # 每个agent最多存储记忆数
+
 retrieval:
   top_k_papers: 4
   top_k_reviews: 12
@@ -25,6 +39,8 @@ retrieval:
   top_k_failure_cards: 5
   similarity_threshold: 0.35
   use_case_memory: true
+  use_agent_memory: true  # 新增：是否启用agent记忆检索
+  top_k_agent_memories: 8  # 新增：每个agent检索记忆数量
 
 distill:
   max_total: 12

@@ -87,6 +87,9 @@ class RetrievalBundle(BaseModel):
     critique_cases: list["ExperienceCard"] = Field(default_factory=list)
     policy_cards: list["ExperienceCard"] = Field(default_factory=list)
     failure_cards: list["ExperienceCard"] = Field(default_factory=list)
+    # === 新增：Agent个人记忆 ===
+    agent_memories: dict[str, list["ExperienceCard"]] = Field(default_factory=dict)  # 按agent分组的记忆
+    agent_memory_scores: dict[str, list[dict]] = Field(default_factory=dict)  # 记忆检索分数
     # 保留原有
     related_papers: list[Paper] = Field(default_factory=list)
     related_reviews: list[Review] = Field(default_factory=list)
@@ -156,6 +159,11 @@ class ExperienceCard(BaseModel):
     source_trace: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    # === 新增：向量检索和Agent个人记忆支持 ===
+    embedding: list[float] | None = None  # 向量表示，用于检索
+    owner_agent: str | None = None  # 所属agent（如 "theme_quality", "arbiter"）
+    memory_tier: Literal["long_term", "short_term", "ephemeral"] = "long_term"  # 记忆层级
+
     @field_validator('kind', mode='before')
     @classmethod
     def migrate_policy_kind(cls, v):
@@ -163,6 +171,16 @@ class ExperienceCard(BaseModel):
         if v == "policy":
             return "strength"
         return v
+
+    @staticmethod
+    def get_card_text(card: "ExperienceCard") -> str:
+        """获取卡片的文本表示，用于embedding"""
+        parts = [card.content]
+        if card.trigger:
+            parts.append("Triggers: " + "; ".join(card.trigger[:3]))
+        if card.theme:
+            parts.append(f"Theme: {card.theme}")
+        return "\n".join(parts)
 
 
 class ActivatedCriterion(BaseModel):

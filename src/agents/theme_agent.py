@@ -30,12 +30,13 @@ class ThemeAgent:
         self.use_fulltext = use_fulltext
         self.max_fulltext_chars = max_fulltext_chars
 
-    def review(self, target: Paper, criteria: list[Criterion], policy_cards: list[ExperienceCard] = None, critique_cards: list[ExperienceCard] = None) -> ThemeOutput:
-        if not criteria and not policy_cards:
+    def review(self, target: Paper, criteria: list[Criterion], policy_cards: list[ExperienceCard] = None, critique_cards: list[ExperienceCard] = None, agent_memories: list[ExperienceCard] = None) -> ThemeOutput:
+        if not criteria and not policy_cards and not agent_memories:
             return ThemeOutput(theme=self.theme, strengths=[], weaknesses=[], severity_tags=[], criteria_used=[])
         policy_cards = policy_cards or []
         critique_cards = critique_cards or []
-        prompt = self._prompt(target, criteria, policy_cards, critique_cards)
+        agent_memories = agent_memories or []  # 新增
+        prompt = self._prompt(target, criteria, policy_cards, critique_cards, agent_memories)
         response = self.config.llm.generate_json(prompt)
 
         # 处理 LLM 返回 list 格式的情况
@@ -82,7 +83,7 @@ class ThemeAgent:
             criteria_used=[c.criterion_id for c in criteria],
         )
 
-    def _prompt(self, target: Paper, criteria: list[Criterion], policy_cards: list[ExperienceCard] = None, critique_cards: list[ExperienceCard] = None) -> str:
+    def _prompt(self, target: Paper, criteria: list[Criterion], policy_cards: list[ExperienceCard] = None, critique_cards: list[ExperienceCard] = None, agent_memories: list[ExperienceCard] = None) -> str:
         serialized = [c.model_dump() for c in criteria]
         fulltext = ""
         if self.use_fulltext and target.fulltext:
@@ -93,6 +94,25 @@ class ThemeAgent:
             f"{i+1}. [{c.theme}] {c.text}"
             for i, c in enumerate(criteria)
         ])
+
+        # === 新增：Agent个人记忆部分 ===
+        agent_memories = agent_memories or []
+        agent_memory_section = ""
+        if agent_memories:
+            memory_items = []
+            for card in agent_memories[:6]:  # 最多6条个人记忆
+                if hasattr(card, 'content'):
+                    content = card.content or ""
+                    allocation_reason = card.metadata.get("allocation_reason", "") if hasattr(card, 'metadata') and card.metadata else ""
+                else:
+                    content = card.get("content", "")
+                    allocation_reason = card.get("metadata", {}).get("allocation_reason", "")
+                if content:
+                    reason_str = f" ({allocation_reason})" if allocation_reason else ""
+                    memory_items.append(f"- {content[:120]}{reason_str}")
+
+            if memory_items:
+                agent_memory_section = "\n## Your Personal Memories\nThese are lessons learned from your past reviews that you should apply:\n" + "\n".join(memory_items) + "\n"
 
         # Add policy cards section
         policy_cards = policy_cards or []
@@ -135,6 +155,7 @@ class ThemeAgent:
             f"Evaluate the paper specifically on criteria related to '{self.theme}'.",
             "Provide specific, evidence-based comments that would help the authors improve their paper.",
             "",
+            agent_memory_section,  # 新增：放在最前面，优先级最高
             "## Review Quality Standards",
             "- Every claim must cite specific evidence (section numbers, equations, experiments, tables)",
             "- Weaknesses should suggest concrete improvements when possible",

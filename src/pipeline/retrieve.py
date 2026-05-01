@@ -15,6 +15,7 @@ from storage.faiss_index import FaissIndex
 from storage.memory_store import MemoryStore
 from storage.multi_case_store import MultiCaseStore
 from storage.multi_memory_store import MultiMemoryStore
+from storage.multi_vector_memory_store import MultiVectorMemoryStore
 from storage.milvus_store import MilvusConfig, MilvusStore
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,7 @@ class Retriever:
         case_store: CaseStore | MultiCaseStore | None = None,
         memory_store: MemoryStore | MultiMemoryStore | None = None,
         deepreview_store: DeepReviewCaseStore | None = None,  # 热插拔 DeepReview 记忆
+        vector_memory_store: MultiVectorMemoryStore | None = None,  # 新增：向量记忆存储
     ) -> None:
         self.venue_id = venue_id
         self.embedding_client = EmbeddingClient(embedding_cfg)
@@ -45,6 +47,7 @@ class Retriever:
         self.case_store = case_store
         self.memory_store = memory_store
         self.deepreview_store = deepreview_store
+        self.vector_memory_store = vector_memory_store  # 新增
 
     def retrieve(
         self,
@@ -56,6 +59,7 @@ class Retriever:
         target_year: int | None,
         paper_signature: PaperSignature | None = None,
         use_case_memory: bool = True,
+        use_agent_memory: bool = True,  # 新增：是否使用agent记忆
     ) -> RetrievalBundle:
         papers = self.doc_store.load_papers(self.venue_id)
         reviews = self.doc_store.load_reviews(self.venue_id)
@@ -254,6 +258,41 @@ class Retriever:
             except Exception as e:
                 logger.warning("Failed to retrieve failure cards: %s", e)
 
+        # === 6. Retrieve agent memories (vector retrieval) ===
+        agent_memories: dict[str, list[ExperienceCard]] = {}
+        agent_memory_scores: dict[str, list[dict]] = {}
+
+        if use_agent_memory and self.vector_memory_store:
+            try:
+                query_text = f"{target_paper.title}\n{target_paper.abstract}"
+
+                # 为每个核心agent检索记忆
+                core_agents = [
+                    "theme_quality", "theme_originality", "theme_clarity",
+                    "theme_significance", "theme_experiments", "arbiter"
+                ]
+
+                agent_results = self.vector_memory_store.retrieve_for_agents(
+                    query_text=query_text,
+                    agent_names=core_agents,
+                    top_k_per_agent=int(self.vector_store.get("top_k_agent_memories", 8)),
+                )
+
+                for agent_name, results in agent_results.items():
+                    agent_memories[agent_name] = [card for card, scores in results]
+                    agent_memory_scores[agent_name] = [
+                        {"card_id": card.card_id, "scores": scores}
+                        for card, scores in results
+                    ]
+
+                logger.info(
+                    "Retrieved agent memories for %d agents (%d total cards)",
+                    len(agent_memories),
+                    sum(len(cards) for cards in agent_memories.values()),
+                )
+            except Exception as e:
+                logger.warning("Failed to retrieve agent memories: %s", e)
+
         trace = {
             "paper_ids": paper_ids,
             "review_ids": review_ids,
@@ -263,6 +302,7 @@ class Retriever:
             "policy_card_ids": [c.card_id for c in policy_cards],
             "critique_card_ids": [c.card_id for c in critique_cases],
             "failure_card_ids": [c.card_id for c in failure_cards],
+            "agent_memory_ids": {agent: [c.card_id for c in cards] for agent, cards in agent_memories.items()},
         }
         return RetrievalBundle(
             target_paper=target_paper,
@@ -271,6 +311,8 @@ class Retriever:
             critique_cases=critique_cases,
             policy_cards=policy_cards,
             failure_cards=failure_cards,
+            agent_memories=agent_memories,  # 新增
+            agent_memory_scores=agent_memory_scores,  # 新增
             related_papers=related_papers,
             related_reviews=related_reviews,
             unrelated_papers=unrelated_papers,

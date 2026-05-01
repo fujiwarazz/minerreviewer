@@ -42,7 +42,9 @@ from storage.memory_store import MemoryStore
 from storage.memory_registry import MemoryRegistry
 from storage.multi_case_store import MultiCaseStore
 from storage.multi_memory_store import MultiMemoryStore
+from storage.multi_vector_memory_store import MultiVectorMemoryStore
 from storage.milvus_store import MilvusConfig
+from pipeline.agent_memory_allocator import AgentMemoryAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +131,26 @@ class ReviewPipeline:
             except Exception as e:
                 logger.warning("Failed to load DeepReview memory: %s", e)
 
+        # === 新增：VectorMemoryStore初始化 ===
+        vector_memory_cfg = memory_cfg.get("vector_memory", {})
+        if vector_memory_cfg.get("enabled", True):
+            self.vector_memory_store = MultiVectorMemoryStore(
+                registry=self.registry,
+                embedding_client=self.embedding_client,
+                milvus_config=MilvusConfig(
+                    host=self.config.get("vector_store", {}).get("host", "localhost"),
+                    port=int(self.config.get("vector_store", {}).get("port", 19530)),
+                    papers_collection="",
+                    reviews_collection="",
+                ) if self.config.get("vector_store", {}).get("backend") == "milvus" else None,
+            )
+            logger.info(
+                "Initialized VectorMemoryStore with %d active memories",
+                len(self.registry.get_active_memories()),
+            )
+        else:
+            self.vector_memory_store = None
+
     def _init_components(self) -> None:
         """初始化处理组件"""
         self.paper_parser = PaperParser(self.llm)
@@ -145,6 +167,14 @@ class ReviewPipeline:
             short_term_utility_threshold=self.config.get("memory", {}).get("short_term_utility_threshold", 0.3),
             long_term_utility_threshold=self.config.get("memory", {}).get("long_term_utility_threshold", 0.6),
         )
+
+        # === 新增：AgentMemoryAllocator ===
+        agent_allocation_cfg = self.config.get("memory", {}).get("agent_allocation", {})
+        if agent_allocation_cfg.get("enabled", True):
+            self.memory_allocator = AgentMemoryAllocator()
+            logger.info("Initialized AgentMemoryAllocator")
+        else:
+            self.memory_allocator = None
 
     def review_paper(self, paper_id: str, target_year: int | None = None) -> ArbiterOutput:
         papers = self.doc_store.load_papers(self.venue_id)
@@ -174,8 +204,8 @@ class ReviewPipeline:
         # 5. Rewrite criteria
         criteria = self._rewrite_criteria(target, activated)
 
-        # 6. Run theme agents
-        theme_outputs = self._run_theme_agents(target, criteria, bundle.policy_cards, bundle.critique_cases)
+        # 6. Run theme agents (with agent memories)
+        theme_outputs = self._run_theme_agents(target, criteria, bundle)
 
         # 7. Aggregate with arbiter (now includes policy_criteria and venue_policy)
         arbiter_output = self._aggregate(
@@ -285,8 +315,10 @@ class ReviewPipeline:
             case_store=self.case_store,
             memory_store=self.memory_store,
             deepreview_store=self.deepreview_store,  # 热插拔 DeepReview 记忆
+            vector_memory_store=self.vector_memory_store,  # 新增：向量记忆存储
         )
         use_case_memory = self.config.get("retrieval", {}).get("use_case_memory", True)
+        use_agent_memory = self.config.get("retrieval", {}).get("use_agent_memory", True)  # 新增
         bundle = retriever.retrieve(
             target,
             retrieval_cfg["top_k_papers"],
@@ -296,13 +328,15 @@ class ReviewPipeline:
             target_year,
             paper_signature=signature,
             use_case_memory=use_case_memory,
+            use_agent_memory=use_agent_memory,  # 新增
         )
         logger.info(
-            "Multi-channel retrieval: %d papers, %d reviews, %d cases, %d policy cards",
+            "Multi-channel retrieval: %d papers, %d reviews, %d cases, %d policy cards, %d agent memories",
             len(bundle.related_papers),
             len(bundle.related_reviews),
             len(bundle.similar_paper_cases),
             len(bundle.policy_cards),
+            sum(len(cards) for cards in bundle.agent_memories.values()),
         )
         return bundle
 
@@ -563,12 +597,13 @@ class ReviewPipeline:
         )
 
     def _update_memory(self, experience: DistillationResult) -> dict:
-        """更新记忆"""
+        """更新记忆 - 新增向量存储和agent分配"""
         updates: dict[str, list[str]] = {
             "paper_cases": [],
             "policy_cards": [],
             "critique_cards": [],
             "failure_cards": [],
+            "agent_memories": [],  # 新增
         }
 
         # Admit paper case
@@ -587,9 +622,52 @@ class ReviewPipeline:
                 elif card.kind == "failure":
                     updates["failure_cards"].append(card.card_id)
 
+        # === 新增：分配卡片到agent并存储到VectorMemoryStore ===
+        if self.vector_memory_store and self.memory_allocator:
+            all_cards = experience.all_cards()
+            if all_cards:
+                agent_allocation_cfg = self.config.get("memory", {}).get("agent_allocation", {})
+                share_strength_with_arbiter = agent_allocation_cfg.get("share_strength_with_arbiter", True)
+
+                allocation = self.memory_allocator.allocate(
+                    all_cards,
+                    share_strength_with_arbiter=share_strength_with_arbiter,
+                )
+
+                for agent_name, cards in allocation.items():
+                    for card in cards:
+                        # 根据卡片年份找到对应的memory库
+                        memory_year = card.metadata.get("memory_year", experience.paper_case.year if experience.paper_case else 2024)
+                        memory_id = f"{card.venue_id or self.venue_id}_{memory_year}_learned"
+
+                        # 尝试添加到对应store
+                        card_ids = self.vector_memory_store.batch_add_cards_to_store(
+                            memory_id,
+                            [card],
+                            owner_agent=agent_name,
+                        )
+                        if card_ids:
+                            updates["agent_memories"].extend(card_ids)
+
+                logger.info(
+                    "Allocated and stored %d agent memories to %d stores",
+                    len(updates["agent_memories"]),
+                    len(self.vector_memory_store._stores),
+                )
+
         return updates
 
-    def _run_theme_agents(self, target: Paper, criteria: list[Criterion], policy_cards: list = None, critique_cards: list = None) -> list[ThemeOutput]:
+    def _run_theme_agents(self, target: Paper, criteria: list[Criterion], bundle) -> list[ThemeOutput]:
+        """运行主题Agent，支持agent个人记忆
+
+        Args:
+            target: 目标论文
+            criteria: 审稿标准列表
+            bundle: RetrievalBundle（包含policy_cards, critique_cases, agent_memories）
+
+        Returns:
+            list of ThemeOutput
+        """
         # 核心 themes - 始终评估这些维度
         core_themes = ["Clarity", "Quality", "Originality", "Significance", "Experiments"]
         themes = list(self.config.get("themes", []))
@@ -609,7 +687,7 @@ class ReviewPipeline:
         max_fulltext_chars = int(review_cfg.get("max_fulltext_chars", 12000))
 
         # Filter policy cards by theme
-        policy_cards = policy_cards or []
+        policy_cards = bundle.policy_cards or []
         themed_policies = {}
         for card in policy_cards:
             # Handle both dict and Pydantic model
@@ -622,7 +700,7 @@ class ReviewPipeline:
             themed_policies[card_theme].append(card)
 
         # Filter critique cards by theme (criticism patterns for weaknesses)
-        critique_cards = critique_cards or []
+        critique_cards = bundle.critique_cases or []
         themed_critiques = {}
         for card in critique_cards:
             if hasattr(card, 'theme'):
@@ -632,6 +710,9 @@ class ReviewPipeline:
             if card_theme not in themed_critiques:
                 themed_critiques[card_theme] = []
             themed_critiques[card_theme].append(card)
+
+        # === 新增：提取agent个人记忆 ===
+        agent_memories = bundle.agent_memories or {}
 
         # Parallel execution of theme agents
         outputs: list[ThemeOutput] = []
@@ -657,13 +738,18 @@ class ReviewPipeline:
 
             themed_pol = themed_policies.get(theme.lower(), [])[:10]  # 每个主题最多10条 policy
             themed_crit = themed_critiques.get(theme.lower(), [])[:8]  # 每个主题最多8条 critique
+
+            # === 新增：获取该theme agent的个人记忆 ===
+            agent_name = f"theme_{theme.lower()}"
+            themed_memories = agent_memories.get(agent_name, [])
+
             agent = ThemeAgent(
                 AgentConfig(name=f"theme_{theme}", llm=self.llm),
                 theme,
                 use_fulltext=use_fulltext,
                 max_fulltext_chars=max_fulltext_chars,
             )
-            return agent.review(target, themed, themed_pol, themed_crit)
+            return agent.review(target, themed, themed_pol, themed_crit, agent_memories=themed_memories)
 
         if max_workers > 1 and len(themes) > 1:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
