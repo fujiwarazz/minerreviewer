@@ -319,6 +319,10 @@ class ReviewPipeline:
         )
         use_case_memory = self.config.get("retrieval", {}).get("use_case_memory", True)
         use_agent_memory = self.config.get("retrieval", {}).get("use_agent_memory", True)  # 新增
+
+        # 从 signature 获取 primary_area（如果有）
+        primary_area = signature.domain if signature else None
+
         bundle = retriever.retrieve(
             target,
             retrieval_cfg["top_k_papers"],
@@ -329,6 +333,7 @@ class ReviewPipeline:
             paper_signature=signature,
             use_case_memory=use_case_memory,
             use_agent_memory=use_agent_memory,  # 新增
+            primary_area=primary_area,  # 新增：领域匹配
         )
         logger.info(
             "Multi-channel retrieval: %d papers, %d reviews, %d cases, %d policy cards, %d agent memories",

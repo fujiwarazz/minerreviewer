@@ -214,6 +214,7 @@ class VectorMemoryStore:
         top_k: int = 10,
         min_utility: float = 0.0,
         use_vector_search: bool = True,
+        primary_area: str | None = None,  # 新增：按领域过滤
     ) -> list[tuple[ExperienceCard, dict[str, float]]]:
         """向量检索卡片
 
@@ -225,11 +226,12 @@ class VectorMemoryStore:
             top_k: 返回数量
             min_utility: 最小utility阈值
             use_vector_search: 是否使用向量检索
+            primary_area: 目标领域，支持三级匹配策略
 
         Returns:
             list of (card, scores_dict)
         """
-        # Step 1: Metadata 过滤
+        # Step 1: Metadata 过滤（含领域三级匹配）
         candidates = self.cards
 
         if owner_agent:
@@ -241,6 +243,28 @@ class VectorMemoryStore:
         if min_utility > 0:
             candidates = [c for c in candidates if c.utility >= min_utility]
 
+        # 领域三级匹配策略
+        if primary_area:
+            level1 = []  # 精确匹配：同领域
+            level2 = []  # 泛化卡片：primary_area=None
+            level3 = []  # 跨领域：不同领域
+
+            for c in candidates:
+                if c.primary_area == primary_area:
+                    level1.append(c)
+                elif c.primary_area is None:
+                    level2.append(c)
+                else:
+                    level3.append(c)
+
+            # 优先填充 level1，不足时用 level2，再不足用 level3
+            candidates = level1 + level2 + level3
+        else:
+            # 无领域指定时，通用卡片优先
+            generic = [c for c in candidates if c.primary_area is None]
+            specific = [c for c in candidates if c.primary_area is not None]
+            candidates = generic + specific
+
         if not candidates:
             return []
 
@@ -250,7 +274,23 @@ class VectorMemoryStore:
             embedding_scores = self._embedding_retrieval(query_text, candidates)
 
         # Step 3: 综合评分和排序
-        scored = self._score_and_rank(candidates, embedding_scores)
+        # 领域降权因子
+        area_penalties: dict[str, float] = {}
+        for c in candidates:
+            if primary_area:
+                if c.primary_area == primary_area:
+                    area_penalties[c.card_id] = 1.0  # 精确匹配
+                elif c.primary_area is None:
+                    area_penalties[c.card_id] = 0.9  # 通用卡片
+                else:
+                    area_penalties[c.card_id] = 0.7  # 跨领域
+            else:
+                if c.primary_area is None:
+                    area_penalties[c.card_id] = 1.0  # 通用卡片优先
+                else:
+                    area_penalties[c.card_id] = 0.8  # 有领域卡片降权
+
+        scored = self._score_and_rank(candidates, embedding_scores, area_penalties)
 
         return scored[:top_k]
 
@@ -310,8 +350,16 @@ class VectorMemoryStore:
         self,
         candidates: list[ExperienceCard],
         embedding_scores: dict[str, float],
+        area_penalties: dict[str, float] | None = None,
     ) -> list[tuple[ExperienceCard, dict[str, float]]]:
-        """综合评分和排序"""
+        """综合评分和排序
+
+        Args:
+            candidates: 候选卡片列表
+            embedding_scores: 向量相似度分数
+            area_penalties: 领域降权因子（card_id → factor）
+        """
+        area_penalties = area_penalties or {}
         scored: list[tuple[ExperienceCard, dict[str, float]]] = []
 
         for card in candidates:
@@ -327,10 +375,16 @@ class VectorMemoryStore:
                 self.utility_weight * (card.utility or 0.5)
             )
 
+            # 领域降权
+            area_penalty = area_penalties.get(card.card_id, 1.0)
+            if area_penalty < 1.0:
+                final_score *= area_penalty
+
             scored.append((card, {
                 "embedding_score": emb_score,
                 "metadata_score": meta_score,
                 "utility_score": card.utility or 0.5,
+                "area_penalty": area_penalty,
                 "final_score": final_score,
             }))
 

@@ -82,6 +82,7 @@ class MultiVectorMemoryStore:
         kind: Literal["strength", "critique", "failure"] | None = None,
         top_k: int = 10,
         merge_stores: bool = True,
+        primary_area: str | None = None,  # 新增：按领域过滤
     ) -> list[tuple[ExperienceCard, dict[str, float]]]:
         """为特定agent检索记忆
 
@@ -103,6 +104,7 @@ class MultiVectorMemoryStore:
                 owner_agent=agent_name,
                 kind=kind,
                 top_k=top_k,
+                primary_area=primary_area,
             )
             # 添加store_id到scores
             for card, scores in results:
@@ -121,6 +123,7 @@ class MultiVectorMemoryStore:
         query_text: str,
         top_k: int = 20,
         kind: Literal["strength", "critique", "failure"] | None = None,
+        primary_area: str | None = None,  # 新增：按领域过滤
     ) -> list[tuple[ExperienceCard, dict[str, float]]]:
         """检索所有记忆（不限agent）
 
@@ -152,6 +155,7 @@ class MultiVectorMemoryStore:
         query_text: str,
         agent_names: list[str],
         top_k_per_agent: int = 8,
+        primary_area: str | None = None,  # 新增：按领域过滤
     ) -> dict[str, list[tuple[ExperienceCard, dict[str, float]]]]:
         """为多个agent检索记忆
 
@@ -169,6 +173,7 @@ class MultiVectorMemoryStore:
                 query_text=query_text,
                 agent_name=agent_name,
                 top_k=top_k_per_agent,
+                primary_area=primary_area,
             )
             results[agent_name] = agent_results
             logger.info(

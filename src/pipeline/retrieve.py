@@ -60,6 +60,7 @@ class Retriever:
         paper_signature: PaperSignature | None = None,
         use_case_memory: bool = True,
         use_agent_memory: bool = True,  # 新增：是否使用agent记忆
+        primary_area: str | None = None,  # 新增：目标论文领域
     ) -> RetrievalBundle:
         papers = self.doc_store.load_papers(self.venue_id)
         reviews = self.doc_store.load_reviews(self.venue_id)
@@ -276,6 +277,7 @@ class Retriever:
                     query_text=query_text,
                     agent_names=core_agents,
                     top_k_per_agent=int(self.vector_store.get("top_k_agent_memories", 8)),
+                    primary_area=primary_area,  # 传入领域信息
                 )
 
                 for agent_name, results in agent_results.items():

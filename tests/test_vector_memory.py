@@ -218,3 +218,74 @@ def test_experience_card_serialization(temp_store_path, sample_cards):
     assert len(store2.cards) == 1
     assert store2.cards[0].card_id == card.card_id
     assert store2.cards[0].owner_agent == "test_agent"  # 检查owner_agent
+
+
+def test_vector_memory_store_domain_filtering(temp_store_path):
+    """测试 VectorMemoryStore 领域过滤（三级匹配）"""
+    store = VectorMemoryStore(temp_store_path)
+
+    # 创建不同领域的卡片（相同utility避免淹没降权效果）
+    nlp_card = ExperienceCard(
+        card_id="nlp_1", kind="strength", theme="quality",
+        content="NLP specific rule", primary_area="nlp", utility=0.7, confidence=0.7,
+    )
+    cv_card = ExperienceCard(
+        card_id="cv_1", kind="strength", theme="quality",
+        content="CV specific rule", primary_area="computer_vision", utility=0.7, confidence=0.7,
+    )
+    generic_card = ExperienceCard(
+        card_id="gen_1", kind="strength", theme="quality",
+        content="General rule", primary_area=None, utility=0.7, confidence=0.7,
+    )
+
+    for c in [nlp_card, cv_card, generic_card]:
+        c_copy = c.model_copy()
+        c_copy.embedding = None
+        store.add_card(c_copy, owner_agent="theme_quality")
+
+    # 查询NLP领域：nlp卡应在cv卡之前，通用卡在最后
+    results = store.retrieve_cards(
+        query_text="test", owner_agent="theme_quality",
+        primary_area="nlp", use_vector_search=False, top_k=10,
+    )
+
+    card_ids = [c.card_id for c, _ in results]
+    assert card_ids[0] == "nlp_1"  # 精确匹配排第一
+    # 跨领域(nlp不匹配cv)降权30%，所以cv可能排在gen(降权10%)之后
+    assert "cv_1" in card_ids
+    assert card_ids.index("nlp_1") < card_ids.index("cv_1")  # NLP排在CV前面
+
+    # 查询CV领域
+    results_cv = store.retrieve_cards(
+        query_text="test", owner_agent="theme_quality",
+        primary_area="computer_vision", use_vector_search=False, top_k=10,
+    )
+
+    card_ids_cv = [c.card_id for c, _ in results_cv]
+    assert card_ids_cv[0] == "cv_1"  # 精确匹配排第一
+
+    # 无领域时，通用卡片优先
+    results_none = store.retrieve_cards(
+        query_text="test", owner_agent="theme_quality",
+        primary_area=None, use_vector_search=False, top_k=10,
+    )
+
+    card_ids_none = [c.card_id for c, _ in results_none]
+    assert card_ids_none[0] == "gen_1"  # 通用卡片排第一
+
+
+def test_experience_card_primary_area_field():
+    """测试 ExperienceCard.primary_area 字段"""
+    card = ExperienceCard(
+        card_id="test", kind="strength", theme="quality", content="Test",
+        primary_area="reinforcement_learning",
+    )
+    assert card.primary_area == "reinforcement_learning"
+
+    # 默认值
+    card2 = ExperienceCard(card_id="test2", kind="strength", theme="quality", content="Test")
+    assert card2.primary_area is None
+
+    # get_card_text 包含primary_area
+    text = ExperienceCard.get_card_text(card)
+    assert "reinforcement_learning" in text

@@ -182,7 +182,7 @@ class ComparisonLearner:
 
         cards = []
         paper_id = paper_info.get("paper_id", "unknown")
-        domain = paper_info.get("primary_area", "general")
+        primary_area = paper_info.get("primary_area", None)  # 获取领域（None=通用）
 
         # 1. missed_patterns → failure cards（最多2条）
         for item in response.get("missed_patterns", [])[:2]:
@@ -203,6 +203,7 @@ class ComparisonLearner:
                 source_ids=[paper_id],
                 created_at=datetime.utcnow(),
                 active=True,
+                primary_area=primary_area,  # 领域路由
                 source_trace={
                     "source": "comparison",
                     "type": "learned_failure",
@@ -212,7 +213,7 @@ class ComparisonLearner:
                 metadata={
                     "memory_year": paper_info.get("year", 2024),
                     "memory_type": "learned_failure",
-                    "memory_domain": domain,
+                    "memory_domain": primary_area,
                 },
             )
             cards.append(card)
@@ -233,6 +234,7 @@ class ComparisonLearner:
                 source_ids=[paper_id],
                 created_at=datetime.utcnow(),
                 active=True,
+                primary_area=primary_area,  # 领域路由
                 source_trace={
                     "source": "comparison",
                     "type": "learned_critique",
@@ -240,7 +242,7 @@ class ComparisonLearner:
                 metadata={
                     "memory_year": paper_info.get("year", 2024),
                     "memory_type": "learned_critique",
-                    "memory_domain": domain,
+                    "memory_domain": primary_area,
                 },
             )
             cards.append(card)
@@ -261,6 +263,7 @@ class ComparisonLearner:
                 source_ids=[paper_id],
                 created_at=datetime.utcnow(),
                 active=True,
+                primary_area=primary_area,  # 领域路由
                 source_trace={
                     "source": "comparison",
                     "type": "learned_strength",
@@ -268,7 +271,7 @@ class ComparisonLearner:
                 metadata={
                     "memory_year": paper_info.get("year", 2024),
                     "memory_type": "learned_strength",
-                    "memory_domain": domain,
+                    "memory_domain": primary_area,
                 },
             )
             cards.append(card)

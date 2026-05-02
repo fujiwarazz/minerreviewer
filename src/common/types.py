@@ -163,6 +163,7 @@ class ExperienceCard(BaseModel):
     embedding: list[float] | None = None  # 向量表示，用于检索
     owner_agent: str | None = None  # 所属agent（如 "theme_quality", "arbiter"）
     memory_tier: Literal["long_term", "short_term", "ephemeral"] = "long_term"  # 记忆层级
+    primary_area: str | None = None  # 所属领域（如 "reinforcement_learning", "generative_models"）
 
     @field_validator('kind', mode='before')
     @classmethod
@@ -176,6 +177,8 @@ class ExperienceCard(BaseModel):
     def get_card_text(card: "ExperienceCard") -> str:
         """获取卡片的文本表示，用于embedding"""
         parts = [card.content]
+        if card.primary_area:
+            parts.insert(0, f"[{card.primary_area}]")
         if card.trigger:
             parts.append("Triggers: " + "; ".join(card.trigger[:3]))
         if card.theme:
