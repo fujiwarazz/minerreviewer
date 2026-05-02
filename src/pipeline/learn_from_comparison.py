@@ -127,6 +127,38 @@ class ComparisonLearner:
 3. **validated_patterns**: AI和GT一致的评价（仅记录，不生成新卡片）
    - 验证现有经验是否有效
 
+## 质量自检（每条候选规则必须通过以下3个问题）
+
+对每条你想生成的规则，必须先回答：
+1. **跨领域自检**: "这条规则换到完全不相关的领域（比如从NLP换到CV），还适用吗？"
+   → 如果答案是"不适用"，丢弃。好的规则应该跨领域成立。
+2. **来源批评**: "这条规则是否只是复述了GT评价的原话，而没有抽象出可迁移的规律？"
+   → 如果答案是"是"，丢弃。你必须在GT和pred之外抽象出通用模式。
+3. **后果预测**: "如果未来的reviewer不知道这条规则，他会犯什么具体的错误？"
+   → 如果你无法描述具体会犯什么错，丢弃。有价值的规则能防止具体错误。
+
+## Few-Shot 质量参考
+
+❌ **BAD (太泛/噪声，不要生成)**:
+{{"general_rule": "Check experimental details carefully"}}
+→ 问题：任何论文都适用，等于没说。没有具体指导价值。
+
+❌ **BAD (领域特定，不可迁移)**:
+{{"general_rule": "Compare with BERT and RoBERTa on GLUE benchmark"}}
+→ 问题：含具体模型名和数据集名，只适用于NLP。其他领域无法使用。
+
+❌ **BAD (复述GT，没有抽象)**:
+{{"general_rule": "The paper lacks comparison with BigGAN and StyleGAN2"}}
+→ 问题：直接复述GT，换一篇论文就完全无用。
+
+✅ **GOOD (抽象、可迁移)**:
+{{"general_rule": "For empirical papers with fewer than 3 baselines, verify the baselines cover at least 2 years of recent related work"}}
+→ 原因：具体指标（<3 baselines）、可验证范围（2 years）、跨领域适用、能防止具体评审遗漏。
+
+✅ **GOOD (纠正评价角度)**:
+{{"correction": "When reviewing method papers in any domain, novelty and contribution clarity should outweigh implementation details in significance assessment"}}
+→ 原因：跨领域适用、纠正具体偏差、能改变审稿质量。
+
 ## 重要过滤规则
 请忽略以下内容，不要生成卡片：
 - **噪声内容**: 泛泛而谈的评价（如"well written", "good experiments"）、格式问题、语言问题等次要因素
@@ -145,6 +177,7 @@ class ComparisonLearner:
 注意：
 - 每条内容要简洁（50-100字），可迁移到其他论文
 - 如果没有真正重要的差异，可以返回空数组
+- **宁可少生成，不要生成低质量卡片**。空数组比噪声好。
 """.format(
             domain=domain,
             title=title[:100],

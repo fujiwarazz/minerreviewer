@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -472,3 +473,101 @@ class VectorMemoryStore:
             stats["by_owner"][owner] = stats["by_owner"].get(owner, 0) + 1
 
         return stats
+
+    # === Effectiveness Tracking ===
+
+    def record_usage(self, card_id: str, paper_id: str) -> None:
+        """记录卡片被某篇论文的 review 使用"""
+        card = self.get_card(card_id)
+        if not card:
+            return
+
+        card.use_count += 1
+        card.use_history.append({
+            "paper_id": paper_id,
+            "timestamp": str(datetime.utcnow()),
+            "outcome": "pending",  # 等待对比学习结果
+        })
+        self._save()
+
+    def apply_feedback(
+        self,
+        card_outcomes: dict[str, str],  # {card_id: "positive"|"negative"|"neutral"}
+        feedback_paper_id: str,
+    ) -> dict[str, Any]:
+        """根据对比学习结果更新卡片质量
+
+        Args:
+            card_outcomes: {card_id: outcome}
+                - "positive": pred和GT一致，卡片帮助了正确评价
+                - "negative": pred和GT不一致，卡片可能误导
+                - "neutral": 无法判断
+            feedback_paper_id: 对应的论文 ID
+
+        Returns:
+            stats dict with updates/degraded/retired counts
+        """
+        stats: dict[str, Any] = {"updated": 0, "degraded": 0, "retired": 0, "promoted": 0}
+
+        for card_id, outcome in card_outcomes.items():
+            card = self.get_card(card_id)
+            if not card:
+                continue
+
+            # 更新 use_history 中对应的 pending 记录
+            for entry in card.use_history:
+                if entry.get("outcome") == "pending" and entry.get("paper_id") == feedback_paper_id:
+                    entry["outcome"] = outcome
+                    break
+
+            old_utility = card.utility
+
+            if outcome == "positive":
+                # 卡片帮助了正确评价 → 提升 utility 和 confidence
+                card.utility = min(1.0, card.utility + 0.08)
+                card.confidence = min(1.0, card.confidence + 0.05)
+                stats["promoted"] += 1
+
+            elif outcome == "negative":
+                # 卡片可能误导 → 降低 utility
+                card.utility = max(0.0, card.utility - 0.15)
+                card.confidence = max(0.0, card.confidence - 0.1)
+                stats["degraded"] += 1
+
+                # 连续2次负面 → 退役
+                recent = [e for e in card.use_history if e.get("paper_id") == feedback_paper_id or True]
+                neg_count = sum(1 for e in card.use_history[-5:] if e.get("outcome") == "negative")
+                if neg_count >= 2 and card.utility < 0.3:
+                    card.active = False
+                    stats["retired"] += 1
+                    logger.info("Card %s retired (utility=%.2f, %d negative outcomes)", card_id[:8], card.utility, neg_count)
+
+            else:  # neutral
+                # 不改变
+                pass
+
+            if abs(card.utility - old_utility) > 0.01:
+                stats["updated"] += 1
+
+        if stats["updated"] > 0:
+            self._save()
+
+        if stats["retired"] > 0 or stats["degraded"] > 0:
+            logger.info(
+                "Feedback applied: %d updated, %d promoted, %d degraded, %d retired",
+                stats["updated"], stats["promoted"], stats["degraded"], stats["retired"],
+            )
+
+        return stats
+
+    def get_low_quality_cards(self, utility_threshold: float = 0.3) -> list[ExperienceCard]:
+        """获取低质量卡片列表"""
+        return [c for c in self.cards if c.utility < utility_threshold and c.active]
+
+    def get_top_cards(self, top_n: int = 20, kind: str | None = None) -> list[ExperienceCard]:
+        """获取高质量卡片列表"""
+        cards = self.cards
+        if kind:
+            cards = [c for c in cards if c.kind == kind]
+        cards.sort(key=lambda c: (c.utility or 0.5) + (c.confidence or 0.5), reverse=True)
+        return cards[:top_n]

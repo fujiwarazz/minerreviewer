@@ -164,6 +164,7 @@ class ExperienceCard(BaseModel):
     owner_agent: str | None = None  # 所属agent（如 "theme_quality", "arbiter"）
     memory_tier: Literal["long_term", "short_term", "ephemeral"] = "long_term"  # 记忆层级
     primary_area: str | None = None  # 所属领域（如 "reinforcement_learning", "generative_models"）
+    use_history: list[dict] = Field(default_factory=list)  # [{paper_id, outcome, timestamp}]，effectiveness tracking
 
     @field_validator('kind', mode='before')
     @classmethod

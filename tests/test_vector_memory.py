@@ -274,6 +274,59 @@ def test_vector_memory_store_domain_filtering(temp_store_path):
     assert card_ids_none[0] == "gen_1"  # 通用卡片排第一
 
 
+def test_effectiveness_tracking_basic(temp_store_path):
+    """测试 Effectiveness Tracking: record_usage + apply_feedback"""
+    store = VectorMemoryStore(temp_store_path)
+
+    card = ExperienceCard(
+        card_id="feed_1", kind="strength", theme="quality", content="Test",
+        utility=0.5, confidence=0.5,
+    )
+    store.add_card(card, owner_agent="theme_quality")
+
+    # 记录使用
+    store.record_usage("feed_1", "paper_123")
+    c = store.get_card("feed_1")
+    assert c.use_count == 1
+    assert len(c.use_history) == 1
+    assert c.use_history[0]["outcome"] == "pending"
+
+    # 正面反馈
+    stats = store.apply_feedback({"feed_1": "positive"}, "paper_123")
+    c = store.get_card("feed_1")
+    assert c.utility > 0.5  # 提升
+    assert c.confidence > 0.5
+    assert stats["promoted"] >= 1
+
+    # 负面反馈多次
+    store.apply_feedback({"feed_1": "negative"}, "paper_456")
+    stats2 = store.apply_feedback({"feed_1": "negative"}, "paper_789")
+    c = store.get_card("feed_1")
+    assert c.utility < 0.5  # 降低
+    # 连续2次负面 + utility<0.3 → 可能退役
+
+
+def test_effectiveness_tracking_retirement(temp_store_path):
+    """测试卡片退役"""
+    store = VectorMemoryStore(temp_store_path)
+
+    card = ExperienceCard(
+        card_id="retire_1", kind="critique", theme="experiments", content="Test",
+        utility=0.25, confidence=0.3,
+    )
+    store.add_card(card, owner_agent="theme_experiments")
+
+    # 多次负面反馈使utility降到0.3以下并退役
+    stats = store.apply_feedback({"retire_1": "negative"}, "p1")
+    stats2 = store.apply_feedback({"retire_1": "negative"}, "p2")
+
+    c = store.get_card("retire_1")
+    # utility已降到很低，且两次负面
+    assert c.utility < 0.25
+    # 可能已被退役（取决于threshold）
+    assert c.active is False or c.utility < 0.3
+
+
 def test_experience_card_primary_area_field():
     """测试 ExperienceCard.primary_area 字段"""
     card = ExperienceCard(

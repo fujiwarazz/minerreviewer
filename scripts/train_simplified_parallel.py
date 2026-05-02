@@ -241,6 +241,9 @@ class SimplifiedPipeline:
                     'critique_cards': len(bundle.critique_cases),
                     'failure_cards': len(bundle.failure_cards),
                     'related_papers': len(bundle.related_papers),
+                    'policy_card_ids': [c.card_id for c in bundle.policy_cards],
+                    'critique_card_ids': [c.card_id for c in bundle.critique_cases],
+                    'failure_card_ids': [c.card_id for c in bundle.failure_cards],
                 },
             }
 
@@ -619,6 +622,61 @@ def serialize_card(card: ExperienceCard) -> dict:
     return data
 
 
+def compute_card_outcomes(result: dict) -> dict[str, str]:
+    """根据对比学习结果判断本轮检索到的卡片的贡献
+
+    原理：
+    - 如果对比学习发现 missed_patterns 很少 → 检索到的卡片帮了忙 → positive
+    - 如果 missed_patterns 很多 → 检索到的卡片不够 → 所涉及主题的卡片 neutral/negative
+    - 如果有 validated_patterns → 那些主题的卡片有效 → positive
+
+    Returns:
+        {card_id: "positive"|"negative"|"neutral"}
+    """
+    outcomes: dict[str, str] = {}
+
+    trace = result.get('trace', {})
+    step7 = trace.get('step7_comparison_learning', {})
+    learned_cards = step7.get('output', {}).get('learned_cards', [])
+
+    if not learned_cards:
+        return outcomes
+
+    # 统计对比学习产出
+    missed_count = sum(1 for c in learned_cards if c.get('kind') == 'failure')
+    bias_count = sum(1 for c in learned_cards if c.get('kind') == 'critique')
+    validated_count = sum(1 for c in learned_cards if c.get('kind') == 'strength')
+
+    # 检索到的卡片ID（从retrieval trace）
+    retrieval_stats = result.get('retrieval_stats', {})
+    # 从trace中获取policy/critique/failure卡片
+    step2 = trace.get('step2_retrieval', {}).get('output', {})
+    policy_card_ids = step2.get('policy_card_ids', [])
+    critique_card_ids = step2.get('critique_card_ids', [])
+    failure_card_ids = step2.get('failure_card_ids', [])
+    all_retrieved_ids = policy_card_ids + critique_card_ids + failure_card_ids
+
+    # 总体质量判断
+    if missed_count == 0 and validated_count >= 1:
+        # 无遗漏且有验证 → 检索到的卡片帮助了正确评价
+        for card_id in all_retrieved_ids:
+            outcomes[card_id] = "positive"
+    elif missed_count == 0:
+        # 无遗漏但也没有验证
+        for card_id in all_retrieved_ids:
+            outcomes[card_id] = "neutral"
+    elif missed_count >= 2:
+        # 多项遗漏 → 检索到的卡片不够
+        for card_id in all_retrieved_ids:
+            outcomes[card_id] = "negative"
+    else:
+        # 少量遗漏 → neutral
+        for card_id in all_retrieved_ids:
+            outcomes[card_id] = "neutral"
+
+    return outcomes
+
+
 def main():
     parser = argparse.ArgumentParser(description="Simplified parallel training")
     parser.add_argument('--tokens', default='tokens.txt', help='Tokens file')
@@ -687,6 +745,36 @@ def main():
     # 保存卡片到learned记忆目录（不覆盖预制记忆）
     if all_cards:
         save_cards(all_cards, "data/processed/memory/ICLR_2024_learned/policy_cards.jsonl")
+
+    # === Effectiveness Tracking: 根据对比学习结果更新卡片质量 ===
+    all_outcomes: dict[str, str] = {}
+    for result in results:
+        if result.get('success'):
+            outcomes = compute_card_outcomes(result)
+            all_outcomes.update(outcomes)
+
+    if all_outcomes:
+        positive_count = sum(1 for v in all_outcomes.values() if v == "positive")
+        negative_count = sum(1 for v in all_outcomes.values() if v == "negative")
+        neutral_count = sum(1 for v in all_outcomes.values() if v == "neutral")
+        logger.info(
+            "Effectiveness Tracking: %d outcomes (%d positive, %d negative, %d neutral)",
+            len(all_outcomes), positive_count, negative_count, neutral_count,
+        )
+
+        # 尝试应用反馈到VectorMemoryStore（如果可用）
+        try:
+            from storage.vector_memory_store import VectorMemoryStore
+            learned_path = Path("data/processed/memory/ICLR_2024_learned/agent_memories.jsonl")
+            if learned_path.exists():
+                store = VectorMemoryStore(learned_path)
+                stats = store.apply_feedback(all_outcomes, "batch_feedback")
+                logger.info(
+                    "Feedback applied: %d updated, %d promoted, %d degraded, %d retired",
+                    stats["updated"], stats["promoted"], stats["degraded"], stats["retired"],
+                )
+        except Exception as e:
+            logger.warning("Failed to apply feedback: %s", e)
 
     # 打印统计
     logger.info("\n" + "=" * 70)
