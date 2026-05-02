@@ -513,19 +513,45 @@ def normalize_text(text: str) -> str:
 
 
 def infer_theme(text: str) -> str:
-    """推断主题"""
+    """推断主题，对齐pipeline的5个核心theme"""
     text_lower = text.lower()
+    # 按优先级匹配，越具体的越靠前
     theme_keywords = {
-        "novelty": ["novel", "new", "original", "contribution"],
-        "quality": ["quality", "correctness", "accuracy", "performance"],
-        "clarity": ["clarity", "writing", "presentation", "clear"],
-        "significance": ["significant", "impact", "important"],
-        "empirical": ["empirical", "experiment", "evaluation", "benchmark"],
-        "methodology": ["method", "approach", "technique", "algorithm"],
+        "Clarity": [
+            "clarity", "writing", "presentation", "clear", "well-written",
+            "readability", "organization", "structure", "polished", "typo",
+            "notation", "explanation", "motivation", "accessible",
+        ],
+        "Quality": [
+            "quality", "correctness", "accuracy", "soundness", "rigor",
+            "theoretical guarantee", "proof", "convergence", "bounded",
+            "assumption", "limitation", "flaw", "error", "validation",
+            "robustness", "sensitive", "hyperparameter",
+        ],
+        "Originality": [
+            "novel", "original", "contribution", "incremental", "novelty",
+            "previously proposed", "prior work", "existing method", "trivial",
+            "straightforward extension", "minor modification", "repackage",
+        ],
+        "Significance": [
+            "significant", "impact", "important", "relevance", "broad",
+            "practical", "deployment", "real-world", "generalization",
+            "downstream", "insight", "takeaway",
+        ],
+        "Experiments": [
+            "experiment", "empirical", "evaluation", "benchmark", "baseline",
+            "dataset", "ablation", "comparison", "reproducibility",
+            "implementation", "hyperparameter", "metric", "result",
+            "compute", "efficiency", "statistical significance", "variance",
+        ],
     }
+    scores = {}
     for theme, keywords in theme_keywords.items():
-        if any(kw in text_lower for kw in keywords):
-            return theme
+        scores[theme] = sum(1 for kw in keywords if kw in text_lower)
+
+    best = max(scores, key=scores.get)
+    if scores[best] > 0:
+        return best
     return "general"
 
 

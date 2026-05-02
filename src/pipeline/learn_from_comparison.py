@@ -168,11 +168,24 @@ class ComparisonLearner:
 
 只有当AI真正**忽略了一个关键评价维度**或**评价角度完全错误**时，才生成卡片。
 
+## Theme 分类要求
+
+每条规则必须标注 theme，只能从以下5个中选择**最贴切的一个**：
+- **Clarity**: 写作、表述、结构、motivation
+- **Quality**: 正确性、严谨性、理论保证、假设合理性
+- **Originality**: 新颖性、增量贡献、与前人工作的区别
+- **Significance**: 影响力、实际价值、可部署性、insight深度
+- **Experiments**: 实验设计、基线、消融、指标、效率
+
+**禁止使用 "general"**。必须从上面5个中选一个。如果你不确定，选择和规则最相关的。
+
 ## 输出格式 (JSON)
 输出一个JSON对象，包含三个数组：
-- missed_patterns: AI遗漏的关键问题数组（最多2条，严格筛选）
-- angle_bias: 评价角度偏差数组（最多1条，必须有明确纠正建议）
-- validated_patterns: 验证有效的模式数组（最多2条，记录但不生成卡片）
+- missed_patterns: 数组，每个元素有 theme (必须从5个中选), general_rule, severity (high/medium/low)
+- angle_bias: 数组，每个元素有 theme (必须从5个中选), correction (纠正建议)
+- validated_patterns: 数组，每个元素有 theme (必须从5个中选), pattern (验证的模式)
+
+每个数组最多限制不变（failure≤2, critique≤1, strength≤2）。
 
 注意：
 - 每条内容要简洁（50-100字），可迁移到其他论文
