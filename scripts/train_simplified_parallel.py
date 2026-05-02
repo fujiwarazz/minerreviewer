@@ -656,21 +656,25 @@ def compute_card_outcomes(result: dict) -> dict[str, str]:
     failure_card_ids = step2.get('failure_card_ids', [])
     all_retrieved_ids = policy_card_ids + critique_card_ids + failure_card_ids
 
-    # 总体质量判断
+    # 总体质量判断（阈值调高，避免过度惩罚）
     if missed_count == 0 and validated_count >= 1:
-        # 无遗漏且有验证 → 检索到的卡片帮助了正确评价
+        # 无遗漏且有验证 → 卡片帮助了
         for card_id in all_retrieved_ids:
             outcomes[card_id] = "positive"
-    elif missed_count == 0:
-        # 无遗漏但也没有验证
+    elif missed_count == 0 and bias_count == 0:
+        # 无任何差异 → neutral（pred和GT高度一致）
         for card_id in all_retrieved_ids:
             outcomes[card_id] = "neutral"
-    elif missed_count >= 2:
-        # 多项遗漏 → 检索到的卡片不够
+    elif missed_count >= 3:
+        # 多个遗漏（≥3）→ 卡片明确不够，negative
         for card_id in all_retrieved_ids:
             outcomes[card_id] = "negative"
+    elif validated_count >= 2 and missed_count <= 1:
+        # 验证有效且遗漏少 → 卡片帮助了
+        for card_id in all_retrieved_ids:
+            outcomes[card_id] = "positive"
     else:
-        # 少量遗漏 → neutral
+        # 少量遗漏 → neutral（正常范围，不做奖惩）
         for card_id in all_retrieved_ids:
             outcomes[card_id] = "neutral"
 
